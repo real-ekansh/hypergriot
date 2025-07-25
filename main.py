@@ -1,381 +1,587 @@
-# main.py
+#!/usr/bin/env python3
 import os
 import sys
-import logging
 import asyncio
-import importlib
-from pathlib import Path
-from typing import Dict, List, Optional
+import sqlite3
+import subprocess
+import logging
 from datetime import datetime
+from typing import Optional, Dict, Any
+import json
+
+# Telegram imports
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
 
 from telethon import TelegramClient, events
 from telethon.tl.types import User, Chat, Channel
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Configuration
-class Config:
-    # Bot credentials
-    API_ID = int(os.getenv('API_ID', '12345'))
-    API_HASH = os.getenv('API_HASH', 'your_api_hash')
-    BOT_TOKEN = os.getenv('BOT_TOKEN', 'your_bot_token')
-    
-    # Admin configuration
-    DEVS = list(map(int, os.getenv('DEVS', '').split(','))) if os.getenv('DEVS') else []
-    SUDOS = list(map(int, os.getenv('SUDOS', '').split(','))) if os.getenv('SUDOS') else []
-    SUPPORTS = list(map(int, os.getenv('SUPPORTS', '').split(','))) if os.getenv('SUPPORTS') else []
-    
-    # Logging
-    LOG_CHAT = int(os.getenv('LOG_CHAT', '0'))  # Private logging chat ID
-    
-    # Database (you can extend this)
-    DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Permission System
-class PermissionLevel:
-    DEV = 4
-    SUDO = 3
-    SUPPORT = 2
-    USER = 1
-    BANNED = 0
+# Bot configuration
+BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+API_ID = int(os.getenv('API_ID', '0'))
+API_HASH = os.getenv('API_HASH', 'YOUR_API_HASH_HERE')
+OWNER_ID = int(os.getenv('OWNER_ID', '0'))  # Bot owner's user ID
 
-class PermissionManager:
-    @staticmethod
-    def get_permission_level(user_id: int) -> int:
-        if user_id in Config.DEVS:
-            return PermissionLevel.DEV
-        elif user_id in Config.SUDOS:
-            return PermissionLevel.SUDO
-        elif user_id in Config.SUPPORTS:
-            return PermissionLevel.SUPPORT
-        else:
-            return PermissionLevel.USER
-    
-    @staticmethod
-    def has_permission(user_id: int, required_level: int) -> bool:
-        return PermissionManager.get_permission_level(user_id) >= required_level
-    
-    @staticmethod
-    def get_permission_name(level: int) -> str:
-        names = {
-            PermissionLevel.DEV: "Developer",
-            PermissionLevel.SUDO: "Sudo",
-            PermissionLevel.SUPPORT: "Support",
-            PermissionLevel.USER: "User",
-            PermissionLevel.BANNED: "Banned"
-        }
-        return names.get(level, "Unknown")
+# Ranking system
+RANKS = {
+    'dev': 4,
+    'sudo': 3,
+    'support': 2,
+    'user': 1
+}
 
-# Logging Setup
-class BotLogger:
-    def __init__(self):
-        self.setup_logging()
-        self.logger = logging.getLogger('TelegramBot')
-        
-    def setup_logging(self):
-        # Create logs directory
-        Path('logs').mkdir(exist_ok=True)
-        
-        # Configure logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(f'logs/bot_{datetime.now().strftime("%Y%m%d")}.log'),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
-        
-        # Separate error logging
-        error_handler = logging.FileHandler(f'logs/errors_{datetime.now().strftime("%Y%m%d")}.log')
-        error_handler.setLevel(logging.ERROR)
-        error_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        
-        error_logger = logging.getLogger('errors')
-        error_logger.addHandler(error_handler)
-    
-    def info(self, message: str):
-        self.logger.info(message)
-    
-    def error(self, message: str, exc_info=None):
-        self.logger.error(message, exc_info=exc_info)
-        # Also log to error file
-        logging.getLogger('errors').error(message, exc_info=exc_info)
-    
-    def warning(self, message: str):
-        self.logger.warning(message)
+RANK_NAMES = {4: 'Dev', 3: 'Sudo', 2: 'Support', 1: 'User'}
 
-# Module System
-class ModuleManager:
-    def __init__(self, bot_instance):
-        self.bot = bot_instance
-        self.modules: Dict[str, object] = {}
-        self.module_commands: Dict[str, str] = {}
-        
-    def load_modules(self, modules_dir: str = "modules"):
-        """Load all modules from the modules directory"""
-        if not os.path.exists(modules_dir):
-            os.makedirs(modules_dir)
-            logger.info(f"Created modules directory: {modules_dir}")
-            return
-        
-        module_files = [f[:-3] for f in os.listdir(modules_dir) 
-                       if f.endswith('.py') and not f.startswith('_')]
-        
-        for module_name in module_files:
-            try:
-                self.load_module(module_name, modules_dir)
-            except Exception as e:
-                logger.error(f"Failed to load module {module_name}: {e}", exc_info=True)
+class Database:
+    def __init__(self, db_path: str = 'bot.db'):
+        self.db_path = db_path
+        self.init_db()
     
-    def load_module(self, module_name: str, modules_dir: str = "modules"):
-        """Load a specific module"""
-        try:
-            # Import the module
-            spec = importlib.util.spec_from_file_location(
-                module_name, f"{modules_dir}/{module_name}.py"
+    def init_db(self):
+        """Initialize the database with required tables"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Users table with ranking system
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                rank INTEGER DEFAULT 1,
+                added_by INTEGER,
+                added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            
-            # Initialize module if it has setup function
-            if hasattr(module, 'setup'):
-                module.setup(self.bot)
-            
-            self.modules[module_name] = module
-            logger.info(f"Successfully loaded module: {module_name}")
-            
-            # Register commands if module has them
-            if hasattr(module, 'COMMANDS'):
-                for cmd in module.COMMANDS:
-                    self.module_commands[cmd] = module_name
-            
-        except Exception as e:
-            logger.error(f"Error loading module {module_name}: {e}", exc_info=True)
-            raise
+        ''')
+        
+        # Groups table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS groups (
+                chat_id INTEGER PRIMARY KEY,
+                chat_title TEXT,
+                chat_type TEXT,
+                added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                user_id INTEGER,
+                action TEXT,
+                details TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Settings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
     
-    def unload_module(self, module_name: str):
-        """Unload a specific module"""
-        if module_name in self.modules:
-            module = self.modules[module_name]
-            
-            # Call cleanup if available
-            if hasattr(module, 'cleanup'):
-                module.cleanup()
-            
-            # Remove commands
-            commands_to_remove = [cmd for cmd, mod in self.module_commands.items() 
-                                if mod == module_name]
-            for cmd in commands_to_remove:
-                del self.module_commands[cmd]
-            
-            del self.modules[module_name]
-            logger.info(f"Unloaded module: {module_name}")
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
     
-    def reload_module(self, module_name: str):
-        """Reload a specific module"""
-        if module_name in self.modules:
-            self.unload_module(module_name)
-        self.load_module(module_name)
+    def add_user(self, user_id: int, username: str = None, first_name: str = None, 
+                 last_name: str = None, rank: int = 1, added_by: int = None):
+        """Add or update user in database"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO users 
+            (user_id, username, first_name, last_name, rank, added_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, first_name, last_name, rank, added_by))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_user_rank(self, user_id: int) -> int:
+        """Get user's rank"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT rank FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        
+        conn.close()
+        return result[0] if result else 1
+    
+    def set_user_rank(self, user_id: int, rank: int, set_by: int) -> bool:
+        """Set user's rank"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # First ensure user exists
+        cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+        if not cursor.fetchone():
+            cursor.execute('''
+                INSERT INTO users (user_id, rank, added_by) VALUES (?, ?, ?)
+            ''', (user_id, rank, set_by))
+        else:
+            cursor.execute('''
+                UPDATE users SET rank = ? WHERE user_id = ?
+            ''', (rank, user_id))
+        
+        conn.commit()
+        conn.close()
+        return True
+    
+    def add_group(self, chat_id: int, chat_title: str, chat_type: str):
+        """Add group to database"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO groups (chat_id, chat_title, chat_type)
+            VALUES (?, ?, ?)
+        ''', (chat_id, chat_title, chat_type))
+        
+        conn.commit()
+        conn.close()
+    
+    def log_action(self, chat_id: int, user_id: int, action: str, details: str = ""):
+        """Log user actions"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO logs (chat_id, user_id, action, details)
+            VALUES (?, ?, ?, ?)
+        ''', (chat_id, user_id, action, details))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_logs(self, limit: int = 10) -> list:
+        """Get recent logs"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT l.*, u.username, u.first_name 
+            FROM logs l
+            LEFT JOIN users u ON l.user_id = u.user_id
+            ORDER BY l.timestamp DESC
+            LIMIT ?
+        ''', (limit,))
+        
+        result = cursor.fetchall()
+        conn.close()
+        return result
 
-# Main Bot Class
-class TelegramGroupBot:
+class TelegramBot:
     def __init__(self):
-        self.telethon_client = TelegramClient('bot_session', Config.API_ID, Config.API_HASH)
-        self.ptb_app = Application.builder().token(Config.BOT_TOKEN).build()
-        self.module_manager = ModuleManager(self)
+        self.db = Database()
+        self.application = None
+        self.telethon_client = None
         
-        # Setup handlers
-        self.setup_handlers()
-        
-    def setup_handlers(self):
-        """Setup basic command handlers"""
-        # PTB handlers
-        self.ptb_app.add_handler(CommandHandler("start", self.start_command))
-        self.ptb_app.add_handler(CommandHandler("help", self.help_command))
-        self.ptb_app.add_handler(CommandHandler("ping", self.ping_command))
-        
-        # Telethon handlers
-        self.telethon_client.add_event_handler(self.on_new_message, events.NewMessage)
+        # Initialize owner
+        if OWNER_ID:
+            self.db.add_user(OWNER_ID, rank=4)  # Dev rank for owner
+    
+    def check_rank(self, user_id: int, required_rank: str) -> bool:
+        """Check if user has required rank or higher"""
+        user_rank = self.db.get_user_rank(user_id)
+        return user_rank >= RANKS.get(required_rank, 1)
+    
+    def is_owner(self, user_id: int) -> bool:
+        """Check if user is the owner"""
+        return user_id == OWNER_ID
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         user = update.effective_user
-        user_permission = PermissionManager.get_permission_level(user.id)
-        permission_name = PermissionManager.get_permission_name(user_permission)
+        chat = update.effective_chat
         
-        await self.log_private(f"User {user.full_name} ({user.id}) started the bot. Permission: {permission_name}")
+        # Add user to database
+        self.db.add_user(
+            user.id, user.username, user.first_name, user.last_name
+        )
         
-        start_text = f"""
-🤖 **Welcome to Group Management Bot!**
+        # Add group if it's a group chat
+        if chat.type in ['group', 'supergroup']:
+            self.db.add_group(chat.id, chat.title, chat.type)
+        
+        # Log action
+        self.db.log_action(chat.id, user.id, "start", "User started the bot")
+        
+        welcome_text = f"""
+🤖 **Group Management Bot**
 
 Hello {user.first_name}! I'm a powerful group management bot.
 
-**Your Permission Level:** {permission_name}
+**Your Info:**
+• Rank: {RANK_NAMES.get(self.db.get_user_rank(user.id), 'User')}
+• User ID: `{user.id}`
 
 **Available Commands:**
-• /help - Show help message
-• /ping - Check bot response time
+• /help - Show all commands
+• /ping - Check bot responsiveness
+• /rank - Check your rank
+• /logs - View recent logs (Dev/Sudo only)
 
-For more commands, use /help or contact administrators.
+**Admin Commands:**
+• /setrank - Set user rank (Owner only)
+• /shell - Execute shell commands (Dev only)
+• /update - Update bot (Dev only)
+
+Join our support chat for help and updates!
         """
         
-        await update.message.reply_text(start_text, parse_mode='Markdown')
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 Help", callback_data="help")],
+            [InlineKeyboardButton("📊 Stats", callback_data="stats")]
+        ])
+        
+        await update.message.reply_text(
+            welcome_text, 
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
-        user_permission = PermissionManager.get_permission_level(update.effective_user.id)
+        user_id = update.effective_user.id
+        user_rank = self.db.get_user_rank(user_id)
         
         help_text = """
-🆘 **Bot Help**
+🔧 **Bot Commands**
 
 **Basic Commands:**
-• /start - Start the bot
-• /ping - Check bot status
-• /help - Show this help message
+• `/start` - Start the bot
+• `/help` - Show this help message
+• `/ping` - Check bot status
+• `/rank` - Check your rank
 
-**Permission Levels:**
-• **Developer** - Full access to all features
-• **Sudo** - Administrative privileges
-• **Support** - Moderate privileges
-• **User** - Basic commands only
-
-**Modules:** {}
-        """.format(", ".join(self.module_manager.modules.keys()) or "None loaded")
+**Support Commands (Support+):**
+"""
         
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        if user_rank >= RANKS['support']:
+            help_text += """
+• `/ban` - Ban a user
+• `/kick` - Kick a user
+• `/mute` - Mute a user
+"""
+        
+        if user_rank >= RANKS['sudo']:
+            help_text += """
+**Sudo Commands:**
+• `/logs` - View recent logs
+• `/stats` - Bot statistics
+"""
+        
+        if user_rank >= RANKS['dev']:
+            help_text += """
+**Dev Commands:**
+• `/shell` - Execute shell commands
+• `/update` - Update the bot
+• `/restart` - Restart the bot
+"""
+        
+        if self.is_owner(user_id):
+            help_text += """
+**Owner Commands:**
+• `/setrank` - Set user ranks
+• `/broadcast` - Broadcast message
+"""
+        
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
     
     async def ping_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /ping command"""
         start_time = datetime.now()
         message = await update.message.reply_text("🏓 Pinging...")
-        
         end_time = datetime.now()
+        
         ping_time = (end_time - start_time).total_seconds() * 1000
         
-        await message.edit_text(f"🏓 **Pong!**\n⏱️ Response time: `{ping_time:.2f}ms`", parse_mode='Markdown')
+        await message.edit_text(
+            f"🏓 **Pong!**\n"
+            f"📡 Latency: `{ping_time:.2f}ms`\n"
+            f"⏰ Time: `{datetime.now().strftime('%H:%M:%S')}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
     
-    async def on_new_message(self, event):
-        """Handle new messages from Telethon"""
-        # This can be used for advanced message handling
-        # that requires Telethon's capabilities
-        pass
-    
-    async def log_private(self, message: str):
-        """Send log message to private logging chat"""
-        if Config.LOG_CHAT:
+    async def rank_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /rank command"""
+        user = update.effective_user
+        target_user = None
+        
+        # Check if replying to someone or mentioning someone
+        if update.message.reply_to_message:
+            target_user = update.message.reply_to_message.from_user
+        elif context.args:
             try:
-                await self.telethon_client.send_message(Config.LOG_CHAT, f"📋 **Bot Log**\n{message}")
-            except Exception as e:
-                logger.error(f"Failed to send private log: {e}")
+                target_id = int(context.args[0])
+                # This is simplified - in practice you'd want to get user info
+                target_user = type('User', (), {'id': target_id, 'first_name': 'User'})()
+            except ValueError:
+                await update.message.reply_text("❌ Invalid user ID!")
+                return
+        else:
+            target_user = user
+        
+        rank_num = self.db.get_user_rank(target_user.id)
+        rank_name = RANK_NAMES.get(rank_num, 'User')
+        
+        await update.message.reply_text(
+            f"👤 **User Rank Info**\n\n"
+            f"**User:** {target_user.first_name}\n"
+            f"**ID:** `{target_user.id}`\n"
+            f"**Rank:** {rank_name} ({rank_num}/4)",
+            parse_mode=ParseMode.MARKDOWN
+        )
     
-    async def start(self):
+    async def setrank_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /setrank command (Owner only)"""
+        if not self.is_owner(update.effective_user.id):
+            await update.message.reply_text("❌ This command is owner-only!")
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "📝 **Usage:** `/setrank <user_id> <rank>`\n\n"
+                "**Available ranks:** dev, sudo, support",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        try:
+            user_id = int(context.args[0])
+            rank_name = context.args[1].lower()
+            
+            if rank_name not in RANKS:
+                await update.message.reply_text("❌ Invalid rank! Use: dev, sudo, support")
+                return
+            
+            rank_num = RANKS[rank_name]
+            self.db.set_user_rank(user_id, rank_num, update.effective_user.id)
+            
+            # Log action
+            self.db.log_action(
+                update.effective_chat.id,
+                update.effective_user.id,
+                "setrank",
+                f"Set user {user_id} to rank {rank_name}"
+            )
+            
+            await update.message.reply_text(
+                f"✅ Successfully set user `{user_id}` to rank **{rank_name.title()}**",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID!")
+    
+    async def logs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /logs command (Sudo+ only)"""
+        if not self.check_rank(update.effective_user.id, 'sudo'):
+            await update.message.reply_text("❌ You need Sudo rank or higher!")
+            return
+        
+        logs = self.db.get_logs(10)
+        
+        if not logs:
+            await update.message.reply_text("📝 No logs found!")
+            return
+        
+        log_text = "📋 **Recent Logs:**\n\n"
+        
+        for log in logs:
+            timestamp = log[5]
+            username = log[6] or "Unknown"
+            action = log[3]
+            details = log[4]
+            
+            log_text += f"• **{action}** by {username}\n"
+            if details:
+                log_text += f"  ↳ {details}\n"
+            log_text += f"  🕐 {timestamp}\n\n"
+        
+        await update.message.reply_text(log_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def shell_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /shell command (Dev only)"""
+        if not self.check_rank(update.effective_user.id, 'dev'):
+            await update.message.reply_text("❌ You need Dev rank!")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("📝 **Usage:** `/shell <command>`")
+            return
+        
+        command = ' '.join(context.args)
+        
+        # Security check - prevent dangerous commands
+        dangerous_cmds = ['rm -rf', 'dd if=', 'mkfs', 'format', ':(){ :|:& };:']
+        if any(cmd in command.lower() for cmd in dangerous_cmds):
+            await update.message.reply_text("❌ Dangerous command blocked!")
+            return
+        
+        try:
+            result = subprocess.run(
+                command, 
+                shell=True, 
+                capture_output=True, 
+                text=True, 
+                timeout=30
+            )
+            
+            output = result.stdout or result.stderr or "No output"
+            
+            # Limit output length
+            if len(output) > 3000:
+                output = output[:3000] + "\n... (truncated)"
+            
+            await update.message.reply_text(
+                f"💻 **Shell Command:**\n`{command}`\n\n"
+                f"**Output:**\n```\n{output}\n```",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Log action
+            self.db.log_action(
+                update.effective_chat.id,
+                update.effective_user.id,
+                "shell",
+                f"Executed: {command}"
+            )
+            
+        except subprocess.TimeoutExpired:
+            await update.message.reply_text("❌ Command timed out!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+    
+    async def update_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /update command (Dev only)"""
+        if not self.check_rank(update.effective_user.id, 'dev'):
+            await update.message.reply_text("❌ You need Dev rank!")
+            return
+        
+        await update.message.reply_text("🔄 Updating bot...")
+        
+        try:
+            # Pull latest changes
+            result = subprocess.run(['git', 'pull'], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                await update.message.reply_text(
+                    f"✅ **Update successful!**\n```\n{result.stdout}\n```",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Log action
+                self.db.log_action(
+                    update.effective_chat.id,
+                    update.effective_user.id,
+                    "update",
+                    "Bot updated successfully"
+                )
+                
+                # Restart bot
+                await update.message.reply_text("🔄 Restarting bot...")
+                os.execv(sys.executable, ['python'] + sys.argv)
+                
+            else:
+                await update.message.reply_text(
+                    f"❌ **Update failed:**\n```\n{result.stderr}\n```",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Update error: {str(e)}")
+    
+    async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all messages for logging"""
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        # Add user to database if not exists
+        if not self.db.get_user_rank(user.id):
+            self.db.add_user(user.id, user.username, user.first_name, user.last_name)
+        
+        # Add group if it's a group chat
+        if chat.type in ['group', 'supergroup']:
+            self.db.add_group(chat.id, chat.title, chat.type)
+    
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors"""
+        logger.error(f"Exception while handling an update: {context.error}")
+    
+    def setup_telethon(self):
+        """Setup Telethon client for advanced features"""
+        if API_ID and API_HASH:
+            self.telethon_client = TelegramClient('bot_session', API_ID, API_HASH)
+            
+            @self.telethon_client.on(events.NewMessage(pattern='/advanced'))
+            async def advanced_handler(event):
+                if self.check_rank(event.sender_id, 'dev'):
+                    await event.reply("🔧 Advanced features available via Telethon!")
+    
+    def run(self):
         """Start the bot"""
-        logger.info("Starting Telegram Group Management Bot...")
+        # Create application
+        self.application = Application.builder().token(BOT_TOKEN).build()
         
-        # Start Telethon client
-        await self.telethon_client.start(bot_token=Config.BOT_TOKEN)
-        logger.info("Telethon client started")
+        # Add handlers
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("ping", self.ping_command))
+        self.application.add_handler(CommandHandler("rank", self.rank_command))
+        self.application.add_handler(CommandHandler("setrank", self.setrank_command))
+        self.application.add_handler(CommandHandler("logs", self.logs_command))
+        self.application.add_handler(CommandHandler("shell", self.shell_command))
+        self.application.add_handler(CommandHandler("update", self.update_command))
         
-        # Load modules
-        self.module_manager.load_modules()
-        logger.info(f"Loaded {len(self.module_manager.modules)} modules")
+        # Message handler for logging
+        self.application.add_handler(
+            MessageHandler(filters.ALL & ~filters.COMMAND, self.message_handler)
+        )
         
-        # Start PTB application
-        await self.ptb_app.initialize()
-        await self.ptb_app.start()
-        logger.info("Python-telegram-bot application started")
+        # Error handler
+        self.application.add_error_handler(self.error_handler)
         
-        # Log startup
-        await self.log_private("🚀 Bot started successfully!")
+        # Setup Telethon
+        self.setup_telethon()
         
-        logger.info("Bot is now running...")
+        logger.info("🤖 Bot started successfully!")
         
-        # Keep running
-        await self.ptb_app.updater.start_polling()
-        await self.telethon_client.run_until_disconnected()
-    
-    async def stop(self):
-        """Stop the bot"""
-        logger.info("Stopping bot...")
-        await self.log_private("🛑 Bot is shutting down...")
-        
-        await self.ptb_app.stop()
-        await self.telethon_client.disconnect()
-        logger.info("Bot stopped")
+        # Start the bot
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# Example Module (modules/example.py)
-EXAMPLE_MODULE = '''
-# modules/example.py
-from telegram import Update
-from telegram.ext import ContextTypes, CommandHandler
-
-# Module metadata
-MODULE_NAME = "Example Module"
-MODULE_VERSION = "1.0.0"
-COMMANDS = ["example", "test"]
-
-async def example_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Example command handler"""
-    await update.message.reply_text("This is an example command from a module!")
-
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test command handler"""
-    await update.message.reply_text("Test command working!")
-
-def setup(bot):
-    """Setup function called when module is loaded"""
-    # Add handlers to the bot
-    bot.ptb_app.add_handler(CommandHandler("example", example_command))
-    bot.ptb_app.add_handler(CommandHandler("test", test_command))
-    print(f"Module {MODULE_NAME} v{MODULE_VERSION} loaded successfully!")
-
-def cleanup():
-    """Cleanup function called when module is unloaded"""
-    print(f"Module {MODULE_NAME} unloaded")
-'''
-
-# Initialize logger
-logger = BotLogger()
-
-# Main execution
-async def main():
-    # Create example module if it doesn't exist
-    os.makedirs('modules', exist_ok=True)
-    if not os.path.exists('modules/example.py'):
-        with open('modules/example.py', 'w') as f:
-            f.write(EXAMPLE_MODULE)
-        logger.info("Created example module")
-    
-    # Create bot instance and start
-    bot = TelegramGroupBot()
-    
-    try:
-        await bot.start()
-    except KeyboardInterrupt:
-        logger.info("Received interrupt signal")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}", exc_info=True)
-    finally:
-        await bot.stop()
-
-if __name__ == "__main__":
-    # Check for required environment variables
-    required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        print(f"Missing required environment variables: {', '.join(missing_vars)}")
-        print("Please set these variables and try again.")
+if __name__ == '__main__':
+    # Check if required environment variables are set
+    if not BOT_TOKEN or BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+        print("❌ Please set BOT_TOKEN environment variable!")
         sys.exit(1)
     
-    # Run the bot
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nBot stopped by user")
-    except Exception as e:
-        print(f"Fatal error: {e}")
+    if not OWNER_ID:
+        print("❌ Please set OWNER_ID environment variable!")
         sys.exit(1)
+    
+    # Start the bot
+    bot = TelegramBot()
+    bot.run()
