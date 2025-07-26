@@ -4,8 +4,9 @@ import sys
 import logging
 import importlib
 import asyncio
+import sqlite3
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -22,11 +23,11 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", 0))
 MODULES_DIR = os.getenv("MODULES_DIR", "modules")
+OWNER_ID = int(os.getenv("OWNER_ID", 0))
+DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
-# Permission levels
-DEV_USERS = set(map(int, os.getenv("DEV_USERS", "").split(","))) if os.getenv("DEV_USERS") else set()
-SUDO_USERS = set(map(int, os.getenv("SUDO_USERS", "").split(","))) if os.getenv("SUDO_USERS") else set()
-SUPPORT_USERS = set(map(int, os.getenv("SUPPORT_USERS", "").split(","))) if os.getenv("SUPPORT_USERS") else set()
+# SQLite database path
+DB_PATH = "bot_database.db"
 
 # Logging setup
 def setup_logging():
@@ -66,33 +67,158 @@ def setup_logging():
     
     error_logger.addHandler(error_file_handler)
     
-    return info_logger, error_logger
+    # Debug logging if enabled
+    if DEBUG:
+        debug_handler = logging.StreamHandler()
+        debug_handler.setLevel(logging.DEBUG)
+        debug_formatter = logging.Formatter(
+            'DEBUG: %(asctime)s - %(name)s - %(funcName)s:%(lineno)d - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        debug_handler.setFormatter(debug_formatter)
+        
+        # Add debug handler to both loggers
+        debug_logger = logging.getLogger("bot_debug")
+        debug_logger.setLevel(logging.DEBUG)
+        debug_logger.addHandler(debug_handler)
+        
+        return info_logger, error_logger, debug_logger
+    
+    return info_logger, error_logger, None
 
-info_logger, error_logger = setup_logging()
+info_logger, error_logger, debug_logger = setup_logging()
+
+class DatabaseManager:
+    """Manage SQLite database for user ranks"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize the database and create tables if they don't exist"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_ranks (
+                user_id INTEGER PRIMARY KEY,
+                rank TEXT NOT NULL,
+                set_by INTEGER,
+                set_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        info_logger.info("Database initialized")
+    
+    def set_rank(self, user_id: int, rank: str, set_by: int) -> bool:
+        """Set or update user rank"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO user_ranks (user_id, rank, set_by, set_date)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, rank, set_by))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            error_logger.error(f"Failed to set rank: {str(e)}", exc_info=True)
+            return False
+    
+    def get_rank(self, user_id: int) -> Optional[str]:
+        """Get user rank from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT rank FROM user_ranks WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            
+            conn.close()
+            return result[0] if result else None
+        except Exception as e:
+            error_logger.error(f"Failed to get rank: {str(e)}", exc_info=True)
+            return None
+    
+    def remove_rank(self, user_id: int) -> bool:
+        """Remove user rank"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('DELETE FROM user_ranks WHERE user_id = ?', (user_id,))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            error_logger.error(f"Failed to remove rank: {str(e)}", exc_info=True)
+            return False
+    
+    def get_all_ranks(self) -> List[tuple]:
+        """Get all user ranks"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT user_id, rank FROM user_ranks ORDER BY rank')
+            results = cursor.fetchall()
+            
+            conn.close()
+            return results
+        except Exception as e:
+            error_logger.error(f"Failed to get all ranks: {str(e)}", exc_info=True)
+            return []
+
+# Initialize database manager
+db_manager = DatabaseManager(DB_PATH)
 
 class PermissionSystem:
     """Custom permission system for the bot"""
     
     @staticmethod
+    def is_owner(user_id: int) -> bool:
+        """Check if user is the owner"""
+        return user_id == OWNER_ID
+    
+    @staticmethod
     def is_dev(user_id: int) -> bool:
-        return user_id in DEV_USERS
+        """Check if user is dev or owner"""
+        if PermissionSystem.is_owner(user_id):
+            return True
+        rank = db_manager.get_rank(user_id)
+        return rank == "dev"
     
     @staticmethod
     def is_sudo(user_id: int) -> bool:
-        return user_id in SUDO_USERS or PermissionSystem.is_dev(user_id)
+        """Check if user is sudo or higher"""
+        if PermissionSystem.is_owner(user_id):
+            return True
+        rank = db_manager.get_rank(user_id)
+        return rank in ["dev", "sudo"]
     
     @staticmethod
     def is_support(user_id: int) -> bool:
-        return user_id in SUPPORT_USERS or PermissionSystem.is_sudo(user_id)
+        """Check if user is support or higher"""
+        if PermissionSystem.is_owner(user_id):
+            return True
+        rank = db_manager.get_rank(user_id)
+        return rank in ["dev", "sudo", "support"]
     
     @staticmethod
     def get_user_rank(user_id: int) -> str:
-        if PermissionSystem.is_dev(user_id):
-            return "Dev"
-        elif PermissionSystem.is_sudo(user_id):
-            return "Sudo"
-        elif PermissionSystem.is_support(user_id):
-            return "Support"
+        """Get user's rank as string"""
+        if PermissionSystem.is_owner(user_id):
+            return "Owner"
+        rank = db_manager.get_rank(user_id)
+        if rank:
+            return rank.capitalize()
         return "User"
 
 class ModuleLoader:
@@ -215,6 +341,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     if PermissionSystem.is_dev(user.id):
         help_text += "\nDev Commands:\n"
+        help_text += "/setrank - Set user rank (Owner only)\n"
+        help_text += "/removerank - Remove user rank (Owner only)\n"
+        help_text += "/listranks - List all user ranks (Owner only)\n"
         help_text += "/reload - Reload a module\n"
         help_text += "/modules - List loaded modules\n"
         help_text += "/eval - Execute Python code\n"
@@ -301,6 +430,9 @@ def main():
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("modules", modules_command))
     application.add_handler(CommandHandler("reload", reload_command))
+    application.add_handler(CommandHandler("setrank", setrank_command))
+    application.add_handler(CommandHandler("removerank", removerank_command))
+    application.add_handler(CommandHandler("listranks", listranks_command))
     
     # Add error handler
     application.add_error_handler(error_handler)
