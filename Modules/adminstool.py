@@ -2,7 +2,7 @@ import asyncio
 import re
 from datetime import datetime, timedelta
 from typing import Optional, Union
-from telegram import Update, ChatMember, User
+from telegram import Update, ChatMember, User, ChatPermissions
 from telegram.ext import ContextTypes, CommandHandler, Application
 from telegram.error import BadRequest, Forbidden
 
@@ -40,7 +40,7 @@ class AdminTools:
             try:
                 chat_member = await context.bot.get_chat_member(update.effective_chat.id, username)
                 return chat_member.user
-            except:
+            except (BadRequest, Forbidden):
                 return None
         
         # Check if it's a user ID
@@ -48,7 +48,7 @@ class AdminTools:
             try:
                 chat_member = await context.bot.get_chat_member(update.effective_chat.id, int(user_identifier))
                 return chat_member.user
-            except:
+            except (BadRequest, Forbidden):
                 return None
         
         return None
@@ -58,7 +58,15 @@ class AdminTools:
         try:
             chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
             return chat_member.status in ['creator', 'administrator']
-        except:
+        except (BadRequest, Forbidden):
+            return False
+    
+    async def can_restrict_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int) -> bool:
+        """Check if bot can restrict the target user (can't restrict admins)"""
+        try:
+            target_member = await context.bot.get_chat_member(update.effective_chat.id, target_user_id)
+            return target_member.status not in ['creator', 'administrator']
+        except (BadRequest, Forbidden):
             return False
     
     async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -70,6 +78,10 @@ class AdminTools:
         user = await self.get_user_from_message(update, context, context.args)
         if not user:
             await update.message.reply_text("Please specify a user to ban (reply, mention, username, or ID).")
+            return
+        
+        if not await self.can_restrict_user(update, context, user.id):
+            await update.message.reply_text("Cannot ban administrators.")
             return
         
         try:
@@ -85,7 +97,7 @@ class AdminTools:
             return
         
         user = await self.get_user_from_message(update, context, context.args)
-        if not user:
+        if not user or not await self.can_restrict_user(update, context, user.id):
             return
         
         try:
@@ -109,27 +121,21 @@ class AdminTools:
             await update.message.reply_text("Please specify a valid user.")
             return
         
+        if not await self.can_restrict_user(update, context, user.id):
+            await update.message.reply_text("Cannot ban administrators.")
+            return
+        
         duration = self.parse_time(context.args[1])
         if not duration:
             await update.message.reply_text("Invalid time format. Use: 1s, 1m, 1h, 1d, 1w")
             return
         
         try:
-            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-            
-            # Schedule unban
-            chat_id = update.effective_chat.id
-            if chat_id not in self.banned_users:
-                self.banned_users[chat_id] = {}
-            
-            unban_time = datetime.now() + timedelta(seconds=duration)
-            self.banned_users[chat_id][user.id] = unban_time
+            until_date = datetime.now() + timedelta(seconds=duration)
+            await context.bot.ban_chat_member(update.effective_chat.id, user.id, until_date=until_date)
             
             reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
             await update.message.reply_text(f"Temporarily banned {user.full_name} for {context.args[1]}\nReason: {reason}")
-            
-            # Schedule unban task
-            asyncio.create_task(self.schedule_unban(context, chat_id, user.id, duration))
         except Exception as e:
             await update.message.reply_text(f"Failed to ban user: {str(e)}")
     
@@ -142,6 +148,10 @@ class AdminTools:
         user = await self.get_user_from_message(update, context, context.args)
         if not user:
             await update.message.reply_text("Please specify a user to kick.")
+            return
+        
+        if not await self.can_restrict_user(update, context, user.id):
+            await update.message.reply_text("Cannot kick administrators.")
             return
         
         try:
@@ -180,11 +190,27 @@ class AdminTools:
             await update.message.reply_text("Please specify a user to mute.")
             return
         
+        if not await self.can_restrict_user(update, context, user.id):
+            await update.message.reply_text("Cannot mute administrators.")
+            return
+        
         try:
+            # Create restrictive permissions (no sending messages, media, etc.)
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False
+            )
+            
             await context.bot.restrict_chat_member(
                 update.effective_chat.id, 
                 user.id,
-                permissions=ChatMember.RESTRICTED
+                permissions=permissions
             )
             reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
             await update.message.reply_text(f"Muted {user.full_name} (ID: {user.id})\nReason: {reason}")
@@ -197,14 +223,25 @@ class AdminTools:
             return
         
         user = await self.get_user_from_message(update, context, context.args)
-        if not user:
+        if not user or not await self.can_restrict_user(update, context, user.id):
             return
         
         try:
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False
+            )
+            
             await context.bot.restrict_chat_member(
                 update.effective_chat.id, 
                 user.id,
-                permissions=ChatMember.RESTRICTED
+                permissions=permissions
             )
             await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
         except:
@@ -225,17 +262,33 @@ class AdminTools:
             await update.message.reply_text("Please specify a valid user.")
             return
         
+        if not await self.can_restrict_user(update, context, user.id):
+            await update.message.reply_text("Cannot mute administrators.")
+            return
+        
         duration = self.parse_time(context.args[1])
         if not duration:
             await update.message.reply_text("Invalid time format. Use: 1s, 1m, 1h, 1d, 1w")
             return
         
         try:
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False
+            )
+            
+            until_date = datetime.now() + timedelta(seconds=duration)
             await context.bot.restrict_chat_member(
                 update.effective_chat.id, 
                 user.id,
-                permissions=ChatMember.RESTRICTED,
-                until_date=datetime.now() + timedelta(seconds=duration)
+                permissions=permissions,
+                until_date=until_date
             )
             
             reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
@@ -255,10 +308,22 @@ class AdminTools:
             return
         
         try:
+            # Restore default permissions
+            permissions = ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_change_info=False,
+                can_invite_users=True,
+                can_pin_messages=False
+            )
+            
             await context.bot.restrict_chat_member(
                 update.effective_chat.id, 
                 user.id,
-                permissions=ChatMember.MEMBER
+                permissions=permissions
             )
             await update.message.reply_text(f"Unmuted {user.full_name} (ID: {user.id})")
         except Exception as e:
@@ -282,13 +347,23 @@ class AdminTools:
                 can_delete_messages=True,
                 can_restrict_members=True,
                 can_pin_messages=True,
-                can_invite_users=True
+                can_invite_users=True,
+                can_change_info=False,
+                can_promote_members=False
             )
-            title = " ".join(context.args[1:]) if len(context.args) > 1 else None
-            if title:
-                await context.bot.set_chat_administrator_custom_title(update.effective_chat.id, user.id, title)
             
-            await update.message.reply_text(f"Promoted {user.full_name} (ID: {user.id})" + (f" with title: {title}" if title else ""))
+            # Set custom title if provided
+            title = " ".join(context.args[1:]) if len(context.args) > 1 else None
+            if title and len(title) <= 16:  # Telegram limit
+                try:
+                    await context.bot.set_chat_administrator_custom_title(update.effective_chat.id, user.id, title)
+                except:
+                    pass
+            
+            response = f"Promoted {user.full_name} (ID: {user.id})"
+            if title:
+                response += f" with title: {title}"
+            await update.message.reply_text(response)
         except Exception as e:
             await update.message.reply_text(f"Failed to promote user: {str(e)}")
     
@@ -311,6 +386,7 @@ class AdminTools:
                 can_restrict_members=False,
                 can_pin_messages=False,
                 can_invite_users=False,
+                can_change_info=False,
                 can_promote_members=False
             )
             await update.message.reply_text(f"Demoted {user.full_name} (ID: {user.id})")
@@ -328,10 +404,13 @@ class AdminTools:
             return
         
         try:
+            # Check if 'loud' or 'notify' is in args for notification control
+            notify = 'loud' in context.args or 'notify' in context.args
+            
             await context.bot.pin_chat_message(
                 update.effective_chat.id, 
                 update.message.reply_to_message.message_id,
-                disable_notification=False
+                disable_notification=not notify
             )
             await update.message.reply_text("Message pinned successfully.")
         except Exception as e:
@@ -345,14 +424,18 @@ class AdminTools:
         
         try:
             if update.message.reply_to_message:
+                # Unpin specific message
                 await context.bot.unpin_chat_message(
                     update.effective_chat.id, 
                     update.message.reply_to_message.message_id
                 )
-            else:
+                await update.message.reply_text("Message unpinned successfully.")
+            elif context.args and context.args[0].lower() == 'all':
+                # Unpin all messages
                 await context.bot.unpin_all_chat_messages(update.effective_chat.id)
-            
-            await update.message.reply_text("Message(s) unpinned successfully.")
+                await update.message.reply_text("All messages unpinned successfully.")
+            else:
+                await update.message.reply_text("Reply to a message to unpin it, or use '/unpin all' to unpin all messages.")
         except Exception as e:
             await update.message.reply_text(f"Failed to unpin message: {str(e)}")
     
@@ -375,7 +458,9 @@ class AdminTools:
                 except:
                     continue
             
-            await update.message.reply_text(f"Deleted {deleted} messages.")
+            confirm_msg = await update.message.reply_text(f"Deleted {deleted} messages.")
+            # Auto-delete confirmation after 5 seconds
+            asyncio.create_task(self.delete_after_delay(context, update.effective_chat.id, confirm_msg.message_id, 5))
         elif context.args and context.args[0].isdigit():
             # Delete specified number of messages
             count = min(int(context.args[0]), 100)  # Limit to 100
@@ -389,14 +474,14 @@ class AdminTools:
                 except:
                     continue
             
-            # Send confirmation and delete it after 3 seconds
+            # Send confirmation and delete it after 5 seconds
             confirm_msg = await context.bot.send_message(
                 update.effective_chat.id, 
                 f"Deleted {deleted} messages."
             )
-            asyncio.create_task(self.delete_after_delay(context, update.effective_chat.id, confirm_msg.message_id, 3))
+            asyncio.create_task(self.delete_after_delay(context, update.effective_chat.id, confirm_msg.message_id, 5))
         else:
-            await update.message.reply_text("Reply to a message to start purging from there, or specify number of messages to delete.")
+            await update.message.reply_text("Reply to a message to start purging from there, or specify number of messages to delete.\nUsage: /purge [number] or reply to message")
     
     async def spurge_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Silent purge - delete messages without confirmation"""
@@ -426,28 +511,27 @@ class AdminTools:
         """Get user/chat ID information"""
         if update.message.reply_to_message:
             user = update.message.reply_to_message.from_user
-            await update.message.reply_text(
-                f"User ID: {user.id}\n"
-                f"Name: {user.full_name}\n"
-                f"Username: @{user.username if user.username else 'None'}\n"
-                f"Chat ID: {update.effective_chat.id}"
-            )
+            text = f"User ID: {user.id}\n"
+            text += f"Name: {user.full_name}\n"
+            text += f"Username: @{user.username if user.username else 'None'}\n"
+            text += f"Chat ID: {update.effective_chat.id}\n"
+            text += f"Message ID: {update.message.reply_to_message.message_id}"
+            await update.message.reply_text(text)
         elif context.args:
             user = await self.get_user_from_message(update, context, context.args)
             if user:
-                await update.message.reply_text(
-                    f"User ID: {user.id}\n"
-                    f"Name: {user.full_name}\n"
-                    f"Username: @{user.username if user.username else 'None'}\n"
-                    f"Chat ID: {update.effective_chat.id}"
-                )
+                text = f"User ID: {user.id}\n"
+                text += f"Name: {user.full_name}\n"
+                text += f"Username: @{user.username if user.username else 'None'}\n"
+                text += f"Chat ID: {update.effective_chat.id}"
+                await update.message.reply_text(text)
             else:
                 await update.message.reply_text("User not found.")
         else:
-            await update.message.reply_text(
-                f"Your ID: {update.effective_user.id}\n"
-                f"Chat ID: {update.effective_chat.id}"
-            )
+            text = f"Your ID: {update.effective_user.id}\n"
+            text += f"Chat ID: {update.effective_chat.id}\n"
+            text += f"Message ID: {update.message.message_id}"
+            await update.message.reply_text(text)
     
     async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Get detailed user information"""
@@ -470,26 +554,29 @@ class AdminTools:
             info_text = f"User Information:\n"
             info_text += f"ID: {user.id}\n"
             info_text += f"Name: {user.full_name}\n"
+            info_text += f"First Name: {user.first_name}\n"
+            if user.last_name:
+                info_text += f"Last Name: {user.last_name}\n"
             info_text += f"Username: @{user.username if user.username else 'None'}\n"
-            info_text += f"Status: {chat_member.status}\n"
+            info_text += f"Status: {chat_member.status.title()}\n"
             info_text += f"Is Bot: {'Yes' if user.is_bot else 'No'}\n"
+            
+            if hasattr(chat_member, 'custom_title') and chat_member.custom_title:
+                info_text += f"Custom Title: {chat_member.custom_title}\n"
             
             if chat_member.status == 'restricted':
                 info_text += f"Restricted: Yes\n"
+                if hasattr(chat_member, 'until_date') and chat_member.until_date:
+                    info_text += f"Until: {chat_member.until_date}\n"
+            
+            if chat_member.status == 'kicked':
+                info_text += f"Banned: Yes\n"
+                if hasattr(chat_member, 'until_date') and chat_member.until_date:
+                    info_text += f"Until: {chat_member.until_date}\n"
             
             await update.message.reply_text(info_text)
         except Exception as e:
             await update.message.reply_text(f"Failed to get user info: {str(e)}")
-    
-    async def schedule_unban(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, duration: int):
-        """Schedule automatic unban after duration"""
-        await asyncio.sleep(duration)
-        try:
-            await context.bot.unban_chat_member(chat_id, user_id)
-            if chat_id in self.banned_users and user_id in self.banned_users[chat_id]:
-                del self.banned_users[chat_id][user_id]
-        except:
-            pass
     
     async def delete_after_delay(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int):
         """Delete a message after specified delay"""
@@ -499,9 +586,9 @@ class AdminTools:
         except:
             pass
     
-    def add_handlers(self, application: Application):
-        """Add all command handlers to the application"""
-        handlers = [
+    def get_handlers(self):
+        """Get all command handlers"""
+        return [
             CommandHandler("ban", self.ban_command),
             CommandHandler("sban", self.sban_command),
             CommandHandler("tban", self.tban_command),
@@ -520,17 +607,19 @@ class AdminTools:
             CommandHandler("id", self.id_command),
             CommandHandler("info", self.info_command),
         ]
-        
-        for handler in handlers:
-            application.add_handler(handler)
 
 # Setup function for module loading
-def setup(application: Application):
+def setup():
     """Setup function to initialize the admin tools module"""
     admin_tools = AdminTools()
-    admin_tools.add_handlers(application)
-    return admin_tools
+    return admin_tools.get_handlers()
 
 # Usage example:
-# admin_tools = AdminTools()
-# admin_tools.add_handlers(application)
+if __name__ == "__main__":
+    # Example usage
+    admin_tools = AdminTools()
+    handlers = admin_tools.get_handlers()
+    
+    # Add handlers to your bot application
+    # for handler in handlers:
+    #     application.add_handler(handler)
