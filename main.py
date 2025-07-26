@@ -359,6 +359,93 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ping_time = (end_time - start_time).total_seconds() * 1000
     await msg.edit_text(f"Pong! Response time: {ping_time:.2f}ms")
 
+async def setrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /setrank command (Owner only)"""
+    user = update.effective_user
+    
+    if not PermissionSystem.is_owner(user.id):
+        await update.message.reply_text("You don't have permission to use this command.")
+        return
+    
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: /setrank <user_id> <rank>\n"
+            "Available ranks: dev, sudo, support"
+        )
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        rank = context.args[1].lower()
+        
+        if rank not in ["dev", "sudo", "support"]:
+            await update.message.reply_text("Invalid rank. Available ranks: dev, sudo, support")
+            return
+        
+        if db_manager.set_rank(target_user_id, rank, user.id):
+            await update.message.reply_text(f"Successfully set rank '{rank}' for user {target_user_id}")
+            info_logger.info(f"Rank '{rank}' set for user {target_user_id} by {user.id}")
+        else:
+            await update.message.reply_text("Failed to set rank. Please check the logs.")
+            
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Please provide a valid numeric user ID.")
+    except Exception as e:
+        error_logger.error(f"Error in setrank command: {str(e)}", exc_info=True)
+        await update.message.reply_text("An error occurred while setting the rank.")
+
+async def removerank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /removerank command (Owner only)"""
+    user = update.effective_user
+    
+    if not PermissionSystem.is_owner(user.id):
+        await update.message.reply_text("You don't have permission to use this command.")
+        return
+    
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /removerank <user_id>")
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        
+        if db_manager.remove_rank(target_user_id):
+            await update.message.reply_text(f"Successfully removed rank for user {target_user_id}")
+            info_logger.info(f"Rank removed for user {target_user_id} by {user.id}")
+        else:
+            await update.message.reply_text("Failed to remove rank. User may not have a rank or check the logs.")
+            
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Please provide a valid numeric user ID.")
+    except Exception as e:
+        error_logger.error(f"Error in removerank command: {str(e)}", exc_info=True)
+        await update.message.reply_text("An error occurred while removing the rank.")
+
+async def listranks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /listranks command (Owner only)"""
+    user = update.effective_user
+    
+    if not PermissionSystem.is_owner(user.id):
+        await update.message.reply_text("You don't have permission to use this command.")
+        return
+    
+    try:
+        ranks = db_manager.get_all_ranks()
+        
+        if not ranks:
+            await update.message.reply_text("No users have ranks assigned.")
+            return
+        
+        ranks_text = "Current User Ranks:\n\n"
+        for user_id, rank in ranks:
+            ranks_text += f"User ID: {user_id} - Rank: {rank.capitalize()}\n"
+        
+        await update.message.reply_text(ranks_text)
+        
+    except Exception as e:
+        error_logger.error(f"Error in listranks command: {str(e)}", exc_info=True)
+        await update.message.reply_text("An error occurred while fetching ranks.")
+
 async def modules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /modules command (Dev only)"""
     user = update.effective_user
