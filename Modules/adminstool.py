@@ -524,6 +524,13 @@ class AdminTools:
         for handler in handlers:
             application.add_handler(handler)
 
+# Setup function for module loading
+def setup(application: Application):
+    """Setup function to initialize the admin tools module"""
+    admin_tools = AdminTools()
+    admin_tools.add_handlers(application)
+    return admin_tools
+
 # Usage example:
 # admin_tools = AdminTools()
 # admin_tools.add_handlers(application)
