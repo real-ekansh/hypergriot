@@ -1,263 +1,530 @@
-# modules/admin.py
-"""Admin module for group management"""
+const { PermissionsBitField, EmbedBuilder } = require('discord.js');
 
-from telegram import Update, ChatPermissions
-from telegram.ext import CommandHandler, ContextTypes, filters
-from telegram.constants import ParseMode
-import logging
-from datetime import datetime, timedelta
+class AdminTools {
+    constructor(client) {
+        this.client = client;
+        this.mutedUsers = new Map(); // Store muted users with expiry times
+        this.bannedUsers = new Map(); // Store temporary bans with expiry times
+    }
 
-# Import permission system from main
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from main import PermissionSystem, info_logger, error_logger
+    // Helper function to resolve user from mention, ID, or username
+    async resolveUser(guild, userInput) {
+        if (!userInput) return null;
 
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ban a user from the group"""
-    user = update.effective_user
-    chat = update.effective_chat
-    
-    # Check if user has support permissions
-    if not PermissionSystem.is_support(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    # Check if command is used in a group
-    if chat.type == 'private':
-        await update.message.reply_text("This command can only be used in groups.")
-        return
-    
-    # Check if replying to a message
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to ban them.")
-        return
-    
-    target_user = update.message.reply_to_message.from_user
-    
-    # Check if target is admin
-    try:
-        member = await chat.get_member(target_user.id)
-        if member.status in ['administrator', 'creator']:
-            await update.message.reply_text("Cannot ban an admin.")
-            return
-    except Exception as e:
-        error_logger.error(f"Error checking member status: {str(e)}", exc_info=True)
-        return
-    
-    # Ban the user
-    try:
-        await chat.ban_member(target_user.id)
-        await update.message.reply_text(f"Banned {target_user.mention_html()}", parse_mode=ParseMode.HTML)
-        info_logger.info(f"User {user.id} banned {target_user.id} from chat {chat.id}")
-    except Exception as e:
-        error_logger.error(f"Failed to ban user: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed to ban user.")
-
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unban a user from the group"""
-    user = update.effective_user
-    chat = update.effective_chat
-    
-    if not PermissionSystem.is_support(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if chat.type == 'private':
-        await update.message.reply_text("This command can only be used in groups.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Usage: /unban <user_id>")
-        return
-    
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid user ID.")
-        return
-    
-    try:
-        await chat.unban_member(target_user_id)
-        await update.message.reply_text(f"Unbanned user {target_user_id}")
-        info_logger.info(f"User {user.id} unbanned {target_user_id} from chat {chat.id}")
-    except Exception as e:
-        error_logger.error(f"Failed to unban user: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed to unban user.")
-
-async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mute a user in the group"""
-    user = update.effective_user
-    chat = update.effective_chat
-    
-    if not PermissionSystem.is_support(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if chat.type == 'private':
-        await update.message.reply_text("This command can only be used in groups.")
-        return
-    
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to mute them.")
-        return
-    
-    target_user = update.message.reply_to_message.from_user
-    
-    # Parse duration
-    duration = 0
-    if context.args:
-        time_str = context.args[0]
-        try:
-            if time_str.endswith('m'):
-                duration = int(time_str[:-1])
-            elif time_str.endswith('h'):
-                duration = int(time_str[:-1]) * 60
-            elif time_str.endswith('d'):
-                duration = int(time_str[:-1]) * 60 * 24
-            else:
-                duration = int(time_str)
-        except ValueError:
-            await update.message.reply_text("Invalid duration format. Use: 5m, 1h, 1d")
-            return
-    
-    # Mute the user
-    try:
-        permissions = ChatPermissions(can_send_messages=False)
+        // Remove mentions and get ID
+        const userId = userInput.replace(/[<@!>]/g, '');
         
-        if duration > 0:
-            until_date = datetime.now() + timedelta(minutes=duration)
-            await chat.restrict_member(target_user.id, permissions, until_date=until_date)
-            await update.message.reply_text(f"Muted {target_user.mention_html()} for {duration} minutes", parse_mode=ParseMode.HTML)
-        else:
-            await chat.restrict_member(target_user.id, permissions)
-            await update.message.reply_text(f"Muted {target_user.mention_html()} indefinitely", parse_mode=ParseMode.HTML)
+        // Try to get by ID first
+        if (/^\d+$/.test(userId)) {
+            try {
+                return await guild.members.fetch(userId);
+            } catch (error) {
+                // Try to get user from client if not in guild
+                try {
+                    return await this.client.users.fetch(userId);
+                } catch (e) {
+                    return null;
+                }
+            }
+        }
+
+        // Try to find by username or display name
+        const members = await guild.members.fetch();
+        return members.find(member => 
+            member.user.username.toLowerCase() === userInput.toLowerCase() ||
+            member.displayName.toLowerCase() === userInput.toLowerCase()
+        );
+    }
+
+    // Helper function to parse time (e.g., "1h", "30m", "7d")
+    parseTime(timeStr) {
+        if (!timeStr) return null;
+        
+        const match = timeStr.match(/^(\d+)([smhd])$/i);
+        if (!match) return null;
+
+        const [, amount, unit] = match;
+        const multipliers = {
+            's': 1000,
+            'm': 60 * 1000,
+            'h': 60 * 60 * 1000,
+            'd': 24 * 60 * 60 * 1000
+        };
+
+        return parseInt(amount) * multipliers[unit.toLowerCase()];
+    }
+
+    // Check if user has required permissions
+    hasPermission(member, permission) {
+        return member.permissions.has(permission);
+    }
+
+    // Create error embed
+    createErrorEmbed(message) {
+        return new EmbedBuilder()
+            .setColor('#FF0000')
+            .setTitle('❌ Error')
+            .setDescription(message);
+    }
+
+    // Create success embed
+    createSuccessEmbed(message) {
+        return new EmbedBuilder()
+            .setColor('#00FF00')
+            .setTitle('✅ Success')
+            .setDescription(message);
+    }
+
+    // BAN COMMAND
+    async ban(message, args, silent = false) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.BanMembers)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to ban members.')] });
+        }
+
+        const userInput = args[0];
+        const reason = args.slice(1).join(' ') || 'No reason provided';
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        try {
+            await message.guild.members.ban(target.id, { reason: `${reason} | Banned by ${message.author.tag}` });
             
-        info_logger.info(f"User {user.id} muted {target_user.id} in chat {chat.id}")
-    except Exception as e:
-        error_logger.error(f"Failed to mute user: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed to mute user.")
+            if (!silent) {
+                await message.reply({ 
+                    embeds: [this.createSuccessEmbed(`Successfully banned ${target.user ? target.user.tag : target.tag}\nReason: ${reason}`)] 
+                });
+            }
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to ban user: ${error.message}`)] });
+        }
+    }
 
-async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unmute a user in the group"""
-    user = update.effective_user
-    chat = update.effective_chat
-    
-    if not PermissionSystem.is_support(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if chat.type == 'private':
-        await update.message.reply_text("This command can only be used in groups.")
-        return
-    
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to unmute them.")
-        return
-    
-    target_user = update.message.reply_to_message.from_user
-    
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=True,
-            can_pin_messages=False
-        )
+    // TEMPORARY BAN COMMAND
+    async tban(message, args, silent = false) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.BanMembers)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to ban members.')] });
+        }
+
+        const userInput = args[0];
+        const timeStr = args[1];
+        const reason = args.slice(2).join(' ') || 'No reason provided';
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        const duration = this.parseTime(timeStr);
+        if (!duration) {
+            return message.reply({ embeds: [this.createErrorEmbed('Invalid time format. Use format like: 1h, 30m, 7d')] });
+        }
+
+        try {
+            await message.guild.members.ban(target.id, { reason: `Temporary ban: ${reason} | Banned by ${message.author.tag}` });
+            
+            const unbanTime = Date.now() + duration;
+            this.bannedUsers.set(target.id, { guildId: message.guild.id, unbanTime });
+
+            setTimeout(async () => {
+                try {
+                    await message.guild.members.unban(target.id, 'Temporary ban expired');
+                    this.bannedUsers.delete(target.id);
+                } catch (error) {
+                    console.error('Failed to auto-unban user:', error);
+                }
+            }, duration);
+
+            if (!silent) {
+                await message.reply({ 
+                    embeds: [this.createSuccessEmbed(`Successfully temp-banned ${target.user ? target.user.tag : target.tag} for ${timeStr}\nReason: ${reason}`)] 
+                });
+            }
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to temp-ban user: ${error.message}`)] });
+        }
+    }
+
+    // UNBAN COMMAND
+    async unban(message, args) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.BanMembers)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to unban members.')] });
+        }
+
+        const userInput = args[0];
+        const reason = args.slice(1).join(' ') || 'No reason provided';
+
+        try {
+            await message.guild.members.unban(userInput.replace(/[<@!>]/g, ''), `${reason} | Unbanned by ${message.author.tag}`);
+            this.bannedUsers.delete(userInput.replace(/[<@!>]/g, ''));
+            
+            await message.reply({ 
+                embeds: [this.createSuccessEmbed(`Successfully unbanned user\nReason: ${reason}`)] 
+            });
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to unban user: ${error.message}`)] });
+        }
+    }
+
+    // KICK COMMAND
+    async kick(message, args, silent = false) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.KickMembers)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to kick members.')] });
+        }
+
+        const userInput = args[0];
+        const reason = args.slice(1).join(' ') || 'No reason provided';
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        try {
+            await target.kick(`${reason} | Kicked by ${message.author.tag}`);
+            
+            if (!silent) {
+                await message.reply({ 
+                    embeds: [this.createSuccessEmbed(`Successfully kicked ${target.user.tag}\nReason: ${reason}`)] 
+                });
+            }
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to kick user: ${error.message}`)] });
+        }
+    }
+
+    // MUTE COMMAND
+    async mute(message, args, silent = false) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ModerateMembers)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to mute members.')] });
+        }
+
+        const userInput = args[0];
+        const reason = args.slice(1).join(' ') || 'No reason provided';
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        try {
+            await target.timeout(28 * 24 * 60 * 60 * 1000, `${reason} | Muted by ${message.author.tag}`); // Max timeout
+            
+            if (!silent) {
+                await message.reply({ 
+                    embeds: [this.createSuccessEmbed(`Successfully muted ${target.user.tag}\nReason: ${reason}`)] 
+                });
+            }
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to mute user: ${error.message}`)] });
+        }
+    }
+
+    // TEMPORARY MUTE COMMAND
+    async tmute(message, args, silent = false) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ModerateMembers)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to mute members.')] });
+        }
+
+        const userInput = args[0];
+        const timeStr = args[1];
+        const reason = args.slice(2).join(' ') || 'No reason provided';
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        const duration = this.parseTime(timeStr);
+        if (!duration) {
+            return message.reply({ embeds: [this.createErrorEmbed('Invalid time format. Use format like: 1h, 30m, 7d')] });
+        }
+
+        try {
+            await target.timeout(duration, `Temporary mute: ${reason} | Muted by ${message.author.tag}`);
+            
+            if (!silent) {
+                await message.reply({ 
+                    embeds: [this.createSuccessEmbed(`Successfully temp-muted ${target.user.tag} for ${timeStr}\nReason: ${reason}`)] 
+                });
+            }
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to temp-mute user: ${error.message}`)] });
+        }
+    }
+
+    // UNMUTE COMMAND
+    async unmute(message, args) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ModerateMembers)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to unmute members.')] });
+        }
+
+        const userInput = args[0];
+        const reason = args.slice(1).join(' ') || 'No reason provided';
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        try {
+            await target.timeout(null, `${reason} | Unmuted by ${message.author.tag}`);
+            
+            await message.reply({ 
+                embeds: [this.createSuccessEmbed(`Successfully unmuted ${target.user.tag}\nReason: ${reason}`)] 
+            });
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to unmute user: ${error.message}`)] });
+        }
+    }
+
+    // PROMOTE COMMAND (Add role)
+    async promote(message, args) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ManageRoles)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to manage roles.')] });
+        }
+
+        const userInput = args[0];
+        const roleInput = args.slice(1).join(' ');
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        const role = message.guild.roles.cache.find(r => 
+            r.name.toLowerCase() === roleInput.toLowerCase() || 
+            r.id === roleInput.replace(/[<@&>]/g, '')
+        );
         
-        await chat.restrict_member(target_user.id, permissions)
-        await update.message.reply_text(f"Unmuted {target_user.mention_html()}", parse_mode=ParseMode.HTML)
-        info_logger.info(f"User {user.id} unmuted {target_user.id} in chat {chat.id}")
-    except Exception as e:
-        error_logger.error(f"Failed to unmute user: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed to unmute user.")
+        if (!role) {
+            return message.reply({ embeds: [this.createErrorEmbed('Role not found.')] });
+        }
 
-async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Promote a user to admin (Sudo only)"""
-    user = update.effective_user
-    chat = update.effective_chat
-    
-    if not PermissionSystem.is_sudo(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if chat.type == 'private':
-        await update.message.reply_text("This command can only be used in groups.")
-        return
-    
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to promote them.")
-        return
-    
-    target_user = update.message.reply_to_message.from_user
-    
-    try:
-        await chat.promote_member(
-            target_user.id,
-            can_change_info=True,
-            can_delete_messages=True,
-            can_invite_users=True,
-            can_restrict_members=True,
-            can_pin_messages=True,
-            can_promote_members=False
-        )
-        await update.message.reply_text(f"Promoted {target_user.mention_html()} to admin", parse_mode=ParseMode.HTML)
-        info_logger.info(f"User {user.id} promoted {target_user.id} in chat {chat.id}")
-    except Exception as e:
-        error_logger.error(f"Failed to promote user: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed to promote user.")
+        try {
+            await target.roles.add(role, `Promoted by ${message.author.tag}`);
+            
+            await message.reply({ 
+                embeds: [this.createSuccessEmbed(`Successfully promoted ${target.user.tag} to ${role.name}`)] 
+            });
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to promote user: ${error.message}`)] });
+        }
+    }
 
-async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Demote an admin (Sudo only)"""
-    user = update.effective_user
-    chat = update.effective_chat
-    
-    if not PermissionSystem.is_sudo(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if chat.type == 'private':
-        await update.message.reply_text("This command can only be used in groups.")
-        return
-    
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to demote them.")
-        return
-    
-    target_user = update.message.reply_to_message.from_user
-    
-    try:
-        await chat.promote_member(
-            target_user.id,
-            can_change_info=False,
-            can_delete_messages=False,
-            can_invite_users=False,
-            can_restrict_members=False,
-            can_pin_messages=False,
-            can_promote_members=False
-        )
-        await update.message.reply_text(f"Demoted {target_user.mention_html()}", parse_mode=ParseMode.HTML)
-        info_logger.info(f"User {user.id} demoted {target_user.id} in chat {chat.id}")
-    except Exception as e:
-        error_logger.error(f"Failed to demote user: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed to demote user.")
+    // DEMOTE COMMAND (Remove role)
+    async demote(message, args) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ManageRoles)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to manage roles.')] });
+        }
 
-def setup():
-    """Setup function called by module loader"""
-    handlers = [
-        CommandHandler("ban", ban_command),
-        CommandHandler("unban", unban_command),
-        CommandHandler("mute", mute_command),
-        CommandHandler("unmute", unmute_command),
-        CommandHandler("promote", promote_command),
-        CommandHandler("demote", demote_command),
-    ]
-    
-    # Store handlers for potential reload
-    globals()['handlers'] = handlers
-    
-    return handlers
+        const userInput = args[0];
+        const roleInput = args.slice(1).join(' ');
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        const role = message.guild.roles.cache.find(r => 
+            r.name.toLowerCase() === roleInput.toLowerCase() || 
+            r.id === roleInput.replace(/[<@&>]/g, '')
+        );
+        
+        if (!role) {
+            return message.reply({ embeds: [this.createErrorEmbed('Role not found.')] });
+        }
+
+        try {
+            await target.roles.remove(role, `Demoted by ${message.author.tag}`);
+            
+            await message.reply({ 
+                embeds: [this.createSuccessEmbed(`Successfully demoted ${target.user.tag} from ${role.name}`)] 
+            });
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to demote user: ${error.message}`)] });
+        }
+    }
+
+    // PIN COMMAND
+    async pin(message, args) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ManageMessages)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to manage messages.')] });
+        }
+
+        const messageId = args[0];
+        if (!messageId) {
+            return message.reply({ embeds: [this.createErrorEmbed('Please provide a message ID.')] });
+        }
+
+        try {
+            const targetMessage = await message.channel.messages.fetch(messageId);
+            await targetMessage.pin();
+            
+            await message.reply({ 
+                embeds: [this.createSuccessEmbed('Successfully pinned the message.')] 
+            });
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to pin message: ${error.message}`)] });
+        }
+    }
+
+    // UNPIN COMMAND
+    async unpin(message, args) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ManageMessages)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to manage messages.')] });
+        }
+
+        const messageId = args[0];
+        if (!messageId) {
+            return message.reply({ embeds: [this.createErrorEmbed('Please provide a message ID.')] });
+        }
+
+        try {
+            const targetMessage = await message.channel.messages.fetch(messageId);
+            await targetMessage.unpin();
+            
+            await message.reply({ 
+                embeds: [this.createSuccessEmbed('Successfully unpinned the message.')] 
+            });
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to unpin message: ${error.message}`)] });
+        }
+    }
+
+    // PURGE COMMAND
+    async purge(message, args, silent = false) {
+        if (!this.hasPermission(message.member, PermissionsBitField.Flags.ManageMessages)) {
+            return message.reply({ embeds: [this.createErrorEmbed('You don\'t have permission to manage messages.')] });
+        }
+
+        const amount = parseInt(args[0]);
+        if (!amount || amount < 1 || amount > 100) {
+            return message.reply({ embeds: [this.createErrorEmbed('Please provide a valid number between 1 and 100.')] });
+        }
+
+        try {
+            const messages = await message.channel.bulkDelete(amount + 1, true); // +1 to include command message
+            
+            if (!silent) {
+                const reply = await message.channel.send({ 
+                    embeds: [this.createSuccessEmbed(`Successfully deleted ${messages.size - 1} messages.`)] 
+                });
+                
+                // Delete confirmation message after 5 seconds
+                setTimeout(() => reply.delete().catch(() => {}), 5000);
+            }
+        } catch (error) {
+            await message.reply({ embeds: [this.createErrorEmbed(`Failed to purge messages: ${error.message}`)] });
+        }
+    }
+
+    // ID COMMAND
+    async id(message, args) {
+        const userInput = args[0];
+        
+        if (!userInput) {
+            // Show command author's ID if no user specified
+            const embed = new EmbedBuilder()
+                .setColor('#0099FF')
+                .setTitle('User ID')
+                .addFields(
+                    { name: 'User', value: message.author.tag, inline: true },
+                    { name: 'ID', value: message.author.id, inline: true }
+                )
+                .setThumbnail(message.author.displayAvatarURL());
+            
+            return message.reply({ embeds: [embed] });
+        }
+
+        const target = await this.resolveUser(message.guild, userInput);
+        if (!target) {
+            return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+        }
+
+        const user = target.user || target;
+        const embed = new EmbedBuilder()
+            .setColor('#0099FF')
+            .setTitle('User ID')
+            .addFields(
+                { name: 'User', value: user.tag, inline: true },
+                { name: 'ID', value: user.id, inline: true }
+            )
+            .setThumbnail(user.displayAvatarURL());
+
+        await message.reply({ embeds: [embed] });
+    }
+
+    // INFO COMMAND
+    async info(message, args) {
+        const userInput = args[0];
+        let target = message.member;
+
+        if (userInput) {
+            target = await this.resolveUser(message.guild, userInput);
+            if (!target) {
+                return message.reply({ embeds: [this.createErrorEmbed('User not found.')] });
+            }
+        }
+
+        const user = target.user || target;
+        const member = target.user ? target : await message.guild.members.fetch(target.id).catch(() => null);
+
+        const embed = new EmbedBuilder()
+            .setColor('#0099FF')
+            .setTitle('User Information')
+            .setThumbnail(user.displayAvatarURL())
+            .addFields(
+                { name: 'Username', value: user.tag, inline: true },
+                { name: 'ID', value: user.id, inline: true },
+                { name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:F>`, inline: false }
+            );
+
+        if (member) {
+            embed.addFields(
+                { name: 'Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:F>`, inline: false },
+                { name: 'Roles', value: member.roles.cache.filter(r => r.id !== message.guild.id).map(r => r.toString()).join(', ') || 'None', inline: false }
+            );
+        }
+
+        await message.reply({ embeds: [embed] });
+    }
+
+    // Command handler
+    async handleCommand(message, command, args) {
+        const commands = {
+            // Regular commands
+            'ban': () => this.ban(message, args),
+            'tban': () => this.tban(message, args),
+            'unban': () => this.unban(message, args),
+            'kick': () => this.kick(message, args),
+            'mute': () => this.mute(message, args),
+            'tmute': () => this.tmute(message, args),
+            'unmute': () => this.unmute(message, args),
+            'promote': () => this.promote(message, args),
+            'demote': () => this.demote(message, args),
+            'pin': () => this.pin(message, args),
+            'unpin': () => this.unpin(message, args),
+            'purge': () => this.purge(message, args),
+            'id': () => this.id(message, args),
+            'info': () => this.info(message, args),
+
+            // Silent commands
+            'sban': () => this.ban(message, args, true),
+            'stban': () => this.tban(message, args, true),
+            'skick': () => this.kick(message, args, true),
+            'smute': () => this.mute(message, args, true),
+            'stmute': () => this.tmute(message, args, true),
+            'spurge': () => this.purge(message, args, true)
+        };
+
+        const commandFunction = commands[command.toLowerCase()];
+        if (commandFunction) {
+            await commandFunction();
+        }
+    }
+}
+
+module.exports = AdminTools;
