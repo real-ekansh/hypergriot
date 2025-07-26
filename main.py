@@ -1,532 +1,534 @@
-# main.py
-import os
-import sys
-import logging
-import importlib
 import asyncio
-import sqlite3
-from pathlib import Path
-from typing import Dict, List, Set, Optional
-from datetime import datetime
-from dotenv import load_dotenv
+import re
+from datetime import datetime, timedelta
+from typing import Optional, Union
+from telegram import Update, ChatMember, User
+from telegram.ext import ContextTypes, CommandHandler, Application
+from telegram.error import BadRequest, Forbidden
 
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from telethon import TelegramClient, events
-
-# Load environment variables
-load_dotenv()
-
-# Bot configuration from .env
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", 0))
-MODULES_DIR = os.getenv("MODULES_DIR", "modules")
-OWNER_ID = int(os.getenv("OWNER_ID", 0))
-DEBUG = os.getenv("DEBUG", "False").lower() == "true"
-
-# SQLite database path
-DB_PATH = "bot_database.db"
-
-# Logging setup
-def setup_logging():
-    # Main logger for general info
-    info_logger = logging.getLogger("bot_info")
-    info_logger.setLevel(logging.INFO)
+class AdminTools:
+    def __init__(self):
+        self.muted_users = {}  # Store temporary mutes: {chat_id: {user_id: unmute_time}}
+        self.banned_users = {}  # Store temporary bans: {chat_id: {user_id: unban_time}}
     
-    # Console handler for info
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    console_handler.setFormatter(console_formatter)
-    
-    # File handler for info
-    info_file_handler = logging.FileHandler('bot_info.log')
-    info_file_handler.setLevel(logging.INFO)
-    info_file_handler.setFormatter(console_formatter)
-    
-    info_logger.addHandler(console_handler)
-    info_logger.addHandler(info_file_handler)
-    
-    # Private logger for errors and tracebacks
-    error_logger = logging.getLogger("bot_errors")
-    error_logger.setLevel(logging.ERROR)
-    
-    # File handler for errors
-    error_file_handler = logging.FileHandler('bot_errors.log')
-    error_file_handler.setLevel(logging.ERROR)
-    error_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    error_file_handler.setFormatter(error_formatter)
-    
-    error_logger.addHandler(error_file_handler)
-    
-    # Debug logging if enabled
-    if DEBUG:
-        debug_handler = logging.StreamHandler()
-        debug_handler.setLevel(logging.DEBUG)
-        debug_formatter = logging.Formatter(
-            'DEBUG: %(asctime)s - %(name)s - %(funcName)s:%(lineno)d - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        debug_handler.setFormatter(debug_formatter)
-        
-        # Add debug handler to both loggers
-        debug_logger = logging.getLogger("bot_debug")
-        debug_logger.setLevel(logging.DEBUG)
-        debug_logger.addHandler(debug_handler)
-        
-        return info_logger, error_logger, debug_logger
-    
-    return info_logger, error_logger, None
-
-info_logger, error_logger, debug_logger = setup_logging()
-
-class DatabaseManager:
-    """Manage SQLite database for user ranks"""
-    
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.init_database()
-    
-    def init_database(self):
-        """Initialize the database and create tables if they don't exist"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_ranks (
-                user_id INTEGER PRIMARY KEY,
-                rank TEXT NOT NULL,
-                set_by INTEGER,
-                set_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        info_logger.info("Database initialized")
-    
-    def set_rank(self, user_id: int, rank: str, set_by: int) -> bool:
-        """Set or update user rank"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO user_ranks (user_id, rank, set_by, set_date)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (user_id, rank, set_by))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            error_logger.error(f"Failed to set rank: {str(e)}", exc_info=True)
-            return False
-    
-    def get_rank(self, user_id: int) -> Optional[str]:
-        """Get user rank from database"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT rank FROM user_ranks WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-            
-            conn.close()
-            return result[0] if result else None
-        except Exception as e:
-            error_logger.error(f"Failed to get rank: {str(e)}", exc_info=True)
+    def parse_time(self, time_str: str) -> Optional[int]:
+        """Parse time string like '1h', '30m', '1d' into seconds"""
+        if not time_str:
             return None
-    
-    def remove_rank(self, user_id: int) -> bool:
-        """Remove user rank"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('DELETE FROM user_ranks WHERE user_id = ?', (user_id,))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            error_logger.error(f"Failed to remove rank: {str(e)}", exc_info=True)
-            return False
-    
-    def get_all_ranks(self) -> List[tuple]:
-        """Get all user ranks"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT user_id, rank FROM user_ranks ORDER BY rank')
-            results = cursor.fetchall()
-            
-            conn.close()
-            return results
-        except Exception as e:
-            error_logger.error(f"Failed to get all ranks: {str(e)}", exc_info=True)
-            return []
-
-# Initialize database manager
-db_manager = DatabaseManager(DB_PATH)
-
-class PermissionSystem:
-    """Custom permission system for the bot"""
-    
-    @staticmethod
-    def is_owner(user_id: int) -> bool:
-        """Check if user is the owner"""
-        return user_id == OWNER_ID
-    
-    @staticmethod
-    def is_dev(user_id: int) -> bool:
-        """Check if user is dev or owner"""
-        if PermissionSystem.is_owner(user_id):
-            return True
-        rank = db_manager.get_rank(user_id)
-        return rank == "dev"
-    
-    @staticmethod
-    def is_sudo(user_id: int) -> bool:
-        """Check if user is sudo or higher"""
-        if PermissionSystem.is_owner(user_id):
-            return True
-        rank = db_manager.get_rank(user_id)
-        return rank in ["dev", "sudo"]
-    
-    @staticmethod
-    def is_support(user_id: int) -> bool:
-        """Check if user is support or higher"""
-        if PermissionSystem.is_owner(user_id):
-            return True
-        rank = db_manager.get_rank(user_id)
-        return rank in ["dev", "sudo", "support"]
-    
-    @staticmethod
-    def get_user_rank(user_id: int) -> str:
-        """Get user's rank as string"""
-        if PermissionSystem.is_owner(user_id):
-            return "Owner"
-        rank = db_manager.get_rank(user_id)
-        if rank:
-            return rank.capitalize()
-        return "User"
-
-class ModuleLoader:
-    """Dynamic module loader system"""
-    
-    def __init__(self, modules_dir: str):
-        self.modules_dir = Path(modules_dir)
-        self.loaded_modules: Dict[str, any] = {}
-        self.module_handlers: List[any] = []
         
-    def load_modules(self, application: Application) -> None:
-        """Load all modules from the modules directory"""
-        if not self.modules_dir.exists():
-            self.modules_dir.mkdir(exist_ok=True)
-            info_logger.info(f"Created modules directory: {self.modules_dir}")
-            return
+        time_units = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+        match = re.match(r'^(\d+)([smhdw])$', time_str.lower())
         
-        # Add modules directory to Python path
-        sys.path.insert(0, str(self.modules_dir.parent))
+        if match:
+            amount, unit = match.groups()
+            return int(amount) * time_units[unit]
+        return None
+    
+    async def get_user_from_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: list) -> Optional[User]:
+        """Extract user from command arguments (mention, username, or ID)"""
+        if update.message.reply_to_message:
+            return update.message.reply_to_message.from_user
         
-        for module_file in self.modules_dir.glob("*.py"):
-            if module_file.name.startswith("_"):
-                continue
-                
-            module_name = module_file.stem
+        if not args:
+            return None
+        
+        user_identifier = args[0]
+        
+        # Check if it's a mention
+        if user_identifier.startswith('@'):
+            username = user_identifier[1:]
             try:
-                # Import the module
-                spec = importlib.util.spec_from_file_location(
-                    f"{self.modules_dir.name}.{module_name}", 
-                    module_file
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                
-                # Check if module has required setup function
-                if hasattr(module, 'setup'):
-                    handlers = module.setup()
-                    if handlers:
-                        for handler in handlers:
-                            application.add_handler(handler)
-                            self.module_handlers.append(handler)
-                        
-                    self.loaded_modules[module_name] = module
-                    info_logger.info(f"Loaded module: {module_name}")
-                else:
-                    info_logger.warning(f"Module {module_name} missing setup() function")
-                    
-            except Exception as e:
-                error_logger.error(f"Failed to load module {module_name}: {str(e)}", exc_info=True)
+                chat_member = await context.bot.get_chat_member(update.effective_chat.id, username)
+                return chat_member.user
+            except:
+                return None
+        
+        # Check if it's a user ID
+        if user_identifier.isdigit():
+            try:
+                chat_member = await context.bot.get_chat_member(update.effective_chat.id, int(user_identifier))
+                return chat_member.user
+            except:
+                return None
+        
+        return None
     
-    def reload_module(self, module_name: str, application: Application) -> bool:
-        """Reload a specific module"""
+    async def is_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+        """Check if user is admin"""
         try:
-            if module_name in self.loaded_modules:
-                # Remove old handlers
-                old_module = self.loaded_modules[module_name]
-                if hasattr(old_module, 'handlers'):
-                    for handler in old_module.handlers:
-                        if handler in self.module_handlers:
-                            application.remove_handler(handler)
-                            self.module_handlers.remove(handler)
-                
-                # Reload the module
-                importlib.reload(self.loaded_modules[module_name])
-                
-                # Re-add handlers
-                if hasattr(self.loaded_modules[module_name], 'setup'):
-                    handlers = self.loaded_modules[module_name].setup()
-                    if handlers:
-                        for handler in handlers:
-                            application.add_handler(handler)
-                            self.module_handlers.append(handler)
-                
-                info_logger.info(f"Reloaded module: {module_name}")
-                return True
-            else:
-                info_logger.warning(f"Module {module_name} not found in loaded modules")
-                return False
-                
-        except Exception as e:
-            error_logger.error(f"Failed to reload module {module_name}: {str(e)}", exc_info=True)
+            chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+            return chat_member.status in ['creator', 'administrator']
+        except:
             return False
-
-# Initialize module loader
-module_loader = ModuleLoader(MODULES_DIR)
-
-# Command handlers
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
-    user = update.effective_user
-    info_logger.info(f"Start command received from user {user.id} ({user.username})")
     
-    rank = PermissionSystem.get_user_rank(user.id)
-    
-    await update.message.reply_text(
-        f"Welcome to the Group Management Bot!\n\n"
-        f"Your ID: {user.id}\n"
-        f"Your Rank: {rank}\n\n"
-        f"Use /help to see available commands."
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help command"""
-    user = update.effective_user
-    rank = PermissionSystem.get_user_rank(user.id)
-    
-    help_text = "Available Commands:\n\n"
-    help_text += "General:\n"
-    help_text += "/start - Start the bot\n"
-    help_text += "/help - Show this help message\n"
-    help_text += "/ping - Check bot response time\n"
-    
-    if PermissionSystem.is_support(user.id):
-        help_text += "\nSupport Commands:\n"
-        help_text += "/stats - Show bot statistics\n"
-    
-    if PermissionSystem.is_sudo(user.id):
-        help_text += "\nSudo Commands:\n"
-        help_text += "/broadcast - Broadcast message to all users\n"
-    
-    if PermissionSystem.is_dev(user.id):
-        help_text += "\nDev Commands:\n"
-        help_text += "/setrank - Set user rank (Owner only)\n"
-        help_text += "/removerank - Remove user rank (Owner only)\n"
-        help_text += "/listranks - List all user ranks (Owner only)\n"
-        help_text += "/reload - Reload a module\n"
-        help_text += "/modules - List loaded modules\n"
-        help_text += "/eval - Execute Python code\n"
-    
-    await update.message.reply_text(help_text)
-
-async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /ping command"""
-    start_time = datetime.now()
-    msg = await update.message.reply_text("Pinging...")
-    end_time = datetime.now()
-    
-    ping_time = (end_time - start_time).total_seconds() * 1000
-    await msg.edit_text(f"Pong! Response time: {ping_time:.2f}ms")
-
-async def setrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /setrank command (Owner only)"""
-    user = update.effective_user
-    
-    if not PermissionSystem.is_owner(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if len(context.args) != 2:
-        await update.message.reply_text(
-            "Usage: /setrank <user_id> <rank>\n"
-            "Available ranks: dev, sudo, support"
-        )
-        return
-    
-    try:
-        target_user_id = int(context.args[0])
-        rank = context.args[1].lower()
-        
-        if rank not in ["dev", "sudo", "support"]:
-            await update.message.reply_text("Invalid rank. Available ranks: dev, sudo, support")
+    async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ban a user permanently"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
             return
         
-        if db_manager.set_rank(target_user_id, rank, user.id):
-            await update.message.reply_text(f"Successfully set rank '{rank}' for user {target_user_id}")
-            info_logger.info(f"Rank '{rank}' set for user {target_user_id} by {user.id}")
-        else:
-            await update.message.reply_text("Failed to set rank. Please check the logs.")
-            
-    except ValueError:
-        await update.message.reply_text("Invalid user ID. Please provide a valid numeric user ID.")
-    except Exception as e:
-        error_logger.error(f"Error in setrank command: {str(e)}", exc_info=True)
-        await update.message.reply_text("An error occurred while setting the rank.")
-
-async def removerank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /removerank command (Owner only)"""
-    user = update.effective_user
-    
-    if not PermissionSystem.is_owner(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /removerank <user_id>")
-        return
-    
-    try:
-        target_user_id = int(context.args[0])
-        
-        if db_manager.remove_rank(target_user_id):
-            await update.message.reply_text(f"Successfully removed rank for user {target_user_id}")
-            info_logger.info(f"Rank removed for user {target_user_id} by {user.id}")
-        else:
-            await update.message.reply_text("Failed to remove rank. User may not have a rank or check the logs.")
-            
-    except ValueError:
-        await update.message.reply_text("Invalid user ID. Please provide a valid numeric user ID.")
-    except Exception as e:
-        error_logger.error(f"Error in removerank command: {str(e)}", exc_info=True)
-        await update.message.reply_text("An error occurred while removing the rank.")
-
-async def listranks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /listranks command (Owner only)"""
-    user = update.effective_user
-    
-    if not PermissionSystem.is_owner(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    try:
-        ranks = db_manager.get_all_ranks()
-        
-        if not ranks:
-            await update.message.reply_text("No users have ranks assigned.")
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a user to ban (reply, mention, username, or ID).")
             return
         
-        ranks_text = "Current User Ranks:\n\n"
-        for user_id, rank in ranks:
-            ranks_text += f"User ID: {user_id} - Rank: {rank.capitalize()}\n"
+        try:
+            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
+            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
+            await update.message.reply_text(f"Banned {user.full_name} (ID: {user.id})\nReason: {reason}")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to ban user: {str(e)}")
+    
+    async def sban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Silent ban - ban without notification"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            return
         
-        await update.message.reply_text(ranks_text)
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            return
         
-    except Exception as e:
-        error_logger.error(f"Error in listranks command: {str(e)}", exc_info=True)
-        await update.message.reply_text("An error occurred while fetching ranks.")
+        try:
+            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
+            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
+        except:
+            pass
+    
+    async def tban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Temporarily ban a user"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /tban <user> <time> [reason]\nExample: /tban @username 1h spam")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a valid user.")
+            return
+        
+        duration = self.parse_time(context.args[1])
+        if not duration:
+            await update.message.reply_text("Invalid time format. Use: 1s, 1m, 1h, 1d, 1w")
+            return
+        
+        try:
+            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
+            
+            # Schedule unban
+            chat_id = update.effective_chat.id
+            if chat_id not in self.banned_users:
+                self.banned_users[chat_id] = {}
+            
+            unban_time = datetime.now() + timedelta(seconds=duration)
+            self.banned_users[chat_id][user.id] = unban_time
+            
+            reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
+            await update.message.reply_text(f"Temporarily banned {user.full_name} for {context.args[1]}\nReason: {reason}")
+            
+            # Schedule unban task
+            asyncio.create_task(self.schedule_unban(context, chat_id, user.id, duration))
+        except Exception as e:
+            await update.message.reply_text(f"Failed to ban user: {str(e)}")
+    
+    async def kick_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Kick a user (ban and immediately unban)"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a user to kick.")
+            return
+        
+        try:
+            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
+            await context.bot.unban_chat_member(update.effective_chat.id, user.id)
+            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
+            await update.message.reply_text(f"Kicked {user.full_name} (ID: {user.id})\nReason: {reason}")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to kick user: {str(e)}")
+    
+    async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Unban a user"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a user to unban.")
+            return
+        
+        try:
+            await context.bot.unban_chat_member(update.effective_chat.id, user.id)
+            await update.message.reply_text(f"Unbanned {user.full_name} (ID: {user.id})")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to unban user: {str(e)}")
+    
+    async def mute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Mute a user permanently"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a user to mute.")
+            return
+        
+        try:
+            await context.bot.restrict_chat_member(
+                update.effective_chat.id, 
+                user.id,
+                permissions=ChatMember.RESTRICTED
+            )
+            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
+            await update.message.reply_text(f"Muted {user.full_name} (ID: {user.id})\nReason: {reason}")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to mute user: {str(e)}")
+    
+    async def smute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Silent mute - mute without notification"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            return
+        
+        try:
+            await context.bot.restrict_chat_member(
+                update.effective_chat.id, 
+                user.id,
+                permissions=ChatMember.RESTRICTED
+            )
+            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
+        except:
+            pass
+    
+    async def tmute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Temporarily mute a user"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /tmute <user> <time> [reason]\nExample: /tmute @username 1h spam")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a valid user.")
+            return
+        
+        duration = self.parse_time(context.args[1])
+        if not duration:
+            await update.message.reply_text("Invalid time format. Use: 1s, 1m, 1h, 1d, 1w")
+            return
+        
+        try:
+            await context.bot.restrict_chat_member(
+                update.effective_chat.id, 
+                user.id,
+                permissions=ChatMember.RESTRICTED,
+                until_date=datetime.now() + timedelta(seconds=duration)
+            )
+            
+            reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
+            await update.message.reply_text(f"Temporarily muted {user.full_name} for {context.args[1]}\nReason: {reason}")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to mute user: {str(e)}")
+    
+    async def unmute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Unmute a user"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a user to unmute.")
+            return
+        
+        try:
+            await context.bot.restrict_chat_member(
+                update.effective_chat.id, 
+                user.id,
+                permissions=ChatMember.MEMBER
+            )
+            await update.message.reply_text(f"Unmuted {user.full_name} (ID: {user.id})")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to unmute user: {str(e)}")
+    
+    async def promote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Promote a user to admin"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a user to promote.")
+            return
+        
+        try:
+            await context.bot.promote_chat_member(
+                update.effective_chat.id, 
+                user.id,
+                can_delete_messages=True,
+                can_restrict_members=True,
+                can_pin_messages=True,
+                can_invite_users=True
+            )
+            title = " ".join(context.args[1:]) if len(context.args) > 1 else None
+            if title:
+                await context.bot.set_chat_administrator_custom_title(update.effective_chat.id, user.id, title)
+            
+            await update.message.reply_text(f"Promoted {user.full_name} (ID: {user.id})" + (f" with title: {title}" if title else ""))
+        except Exception as e:
+            await update.message.reply_text(f"Failed to promote user: {str(e)}")
+    
+    async def demote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Demote an admin to regular user"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        user = await self.get_user_from_message(update, context, context.args)
+        if not user:
+            await update.message.reply_text("Please specify a user to demote.")
+            return
+        
+        try:
+            await context.bot.promote_chat_member(
+                update.effective_chat.id, 
+                user.id,
+                can_delete_messages=False,
+                can_restrict_members=False,
+                can_pin_messages=False,
+                can_invite_users=False,
+                can_promote_members=False
+            )
+            await update.message.reply_text(f"Demoted {user.full_name} (ID: {user.id})")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to demote user: {str(e)}")
+    
+    async def pin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Pin a message"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        if not update.message.reply_to_message:
+            await update.message.reply_text("Reply to a message to pin it.")
+            return
+        
+        try:
+            await context.bot.pin_chat_message(
+                update.effective_chat.id, 
+                update.message.reply_to_message.message_id,
+                disable_notification=False
+            )
+            await update.message.reply_text("Message pinned successfully.")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to pin message: {str(e)}")
+    
+    async def unpin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Unpin a message"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        try:
+            if update.message.reply_to_message:
+                await context.bot.unpin_chat_message(
+                    update.effective_chat.id, 
+                    update.message.reply_to_message.message_id
+                )
+            else:
+                await context.bot.unpin_all_chat_messages(update.effective_chat.id)
+            
+            await update.message.reply_text("Message(s) unpinned successfully.")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to unpin message: {str(e)}")
+    
+    async def purge_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Delete messages (reply to start message or specify count)"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            await update.message.reply_text("You need admin permissions to use this command.")
+            return
+        
+        if update.message.reply_to_message:
+            # Delete from replied message to current
+            start_id = update.message.reply_to_message.message_id
+            end_id = update.message.message_id
+            deleted = 0
+            
+            for msg_id in range(start_id, end_id + 1):
+                try:
+                    await context.bot.delete_message(update.effective_chat.id, msg_id)
+                    deleted += 1
+                except:
+                    continue
+            
+            await update.message.reply_text(f"Deleted {deleted} messages.")
+        elif context.args and context.args[0].isdigit():
+            # Delete specified number of messages
+            count = min(int(context.args[0]), 100)  # Limit to 100
+            deleted = 0
+            current_id = update.message.message_id
+            
+            for i in range(count + 1):  # +1 to include command message
+                try:
+                    await context.bot.delete_message(update.effective_chat.id, current_id - i)
+                    deleted += 1
+                except:
+                    continue
+            
+            # Send confirmation and delete it after 3 seconds
+            confirm_msg = await context.bot.send_message(
+                update.effective_chat.id, 
+                f"Deleted {deleted} messages."
+            )
+            asyncio.create_task(self.delete_after_delay(context, update.effective_chat.id, confirm_msg.message_id, 3))
+        else:
+            await update.message.reply_text("Reply to a message to start purging from there, or specify number of messages to delete.")
+    
+    async def spurge_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Silent purge - delete messages without confirmation"""
+        if not await self.is_admin(update, context, update.effective_user.id):
+            return
+        
+        if update.message.reply_to_message:
+            start_id = update.message.reply_to_message.message_id
+            end_id = update.message.message_id
+            
+            for msg_id in range(start_id, end_id + 1):
+                try:
+                    await context.bot.delete_message(update.effective_chat.id, msg_id)
+                except:
+                    continue
+        elif context.args and context.args[0].isdigit():
+            count = min(int(context.args[0]), 100)
+            current_id = update.message.message_id
+            
+            for i in range(count + 1):
+                try:
+                    await context.bot.delete_message(update.effective_chat.id, current_id - i)
+                except:
+                    continue
+    
+    async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Get user/chat ID information"""
+        if update.message.reply_to_message:
+            user = update.message.reply_to_message.from_user
+            await update.message.reply_text(
+                f"User ID: {user.id}\n"
+                f"Name: {user.full_name}\n"
+                f"Username: @{user.username if user.username else 'None'}\n"
+                f"Chat ID: {update.effective_chat.id}"
+            )
+        elif context.args:
+            user = await self.get_user_from_message(update, context, context.args)
+            if user:
+                await update.message.reply_text(
+                    f"User ID: {user.id}\n"
+                    f"Name: {user.full_name}\n"
+                    f"Username: @{user.username if user.username else 'None'}\n"
+                    f"Chat ID: {update.effective_chat.id}"
+                )
+            else:
+                await update.message.reply_text("User not found.")
+        else:
+            await update.message.reply_text(
+                f"Your ID: {update.effective_user.id}\n"
+                f"Chat ID: {update.effective_chat.id}"
+            )
+    
+    async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Get detailed user information"""
+        user = None
+        
+        if update.message.reply_to_message:
+            user = update.message.reply_to_message.from_user
+        elif context.args:
+            user = await self.get_user_from_message(update, context, context.args)
+        else:
+            user = update.effective_user
+        
+        if not user:
+            await update.message.reply_text("User not found.")
+            return
+        
+        try:
+            chat_member = await context.bot.get_chat_member(update.effective_chat.id, user.id)
+            
+            info_text = f"User Information:\n"
+            info_text += f"ID: {user.id}\n"
+            info_text += f"Name: {user.full_name}\n"
+            info_text += f"Username: @{user.username if user.username else 'None'}\n"
+            info_text += f"Status: {chat_member.status}\n"
+            info_text += f"Is Bot: {'Yes' if user.is_bot else 'No'}\n"
+            
+            if chat_member.status == 'restricted':
+                info_text += f"Restricted: Yes\n"
+            
+            await update.message.reply_text(info_text)
+        except Exception as e:
+            await update.message.reply_text(f"Failed to get user info: {str(e)}")
+    
+    async def schedule_unban(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, duration: int):
+        """Schedule automatic unban after duration"""
+        await asyncio.sleep(duration)
+        try:
+            await context.bot.unban_chat_member(chat_id, user_id)
+            if chat_id in self.banned_users and user_id in self.banned_users[chat_id]:
+                del self.banned_users[chat_id][user_id]
+        except:
+            pass
+    
+    async def delete_after_delay(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int):
+        """Delete a message after specified delay"""
+        await asyncio.sleep(delay)
+        try:
+            await context.bot.delete_message(chat_id, message_id)
+        except:
+            pass
+    
+    def get_handlers(self):
+        """Get all command handlers"""
+        return [
+            CommandHandler("ban", self.ban_command),
+            CommandHandler("sban", self.sban_command),
+            CommandHandler("tban", self.tban_command),
+            CommandHandler("kick", self.kick_command),
+            CommandHandler("unban", self.unban_command),
+            CommandHandler("mute", self.mute_command),
+            CommandHandler("smute", self.smute_command),
+            CommandHandler("tmute", self.tmute_command),
+            CommandHandler("unmute", self.unmute_command),
+            CommandHandler("promote", self.promote_command),
+            CommandHandler("demote", self.demote_command),
+            CommandHandler("pin", self.pin_command),
+            CommandHandler("unpin", self.unpin_command),
+            CommandHandler("purge", self.purge_command),
+            CommandHandler("spurge", self.spurge_command),
+            CommandHandler("id", self.id_command),
+            CommandHandler("info", self.info_command),
+        ]
 
-async def modules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /modules command (Dev only)"""
-    user = update.effective_user
-    
-    if not PermissionSystem.is_dev(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if module_loader.loaded_modules:
-        modules_list = "\n".join([f"- {name}" for name in module_loader.loaded_modules.keys()])
-        await update.message.reply_text(f"Loaded modules:\n{modules_list}")
-    else:
-        await update.message.reply_text("No modules loaded.")
+# Setup function for module loading
+def setup():
+    """Setup function to initialize the admin tools module"""
+    admin_tools = AdminTools()
+    return admin_tools.get_handlers()
 
-async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /reload command (Dev only)"""
-    user = update.effective_user
-    
-    if not PermissionSystem.is_dev(user.id):
-        await update.message.reply_text("You don't have permission to use this command.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Usage: /reload <module_name>")
-        return
-    
-    module_name = context.args[0]
-    if module_loader.reload_module(module_name, context.application):
-        await update.message.reply_text(f"Successfully reloaded module: {module_name}")
-    else:
-        await update.message.reply_text(f"Failed to reload module: {module_name}")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors caused by updates"""
-    error_logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
-    
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "An error occurred while processing your request. The developers have been notified."
-        )
-
-async def post_init(application: Application) -> None:
-    """Initialize bot after startup"""
-    # Set bot commands
-    commands = [
-        BotCommand("start", "Start the bot"),
-        BotCommand("help", "Show help message"),
-        BotCommand("ping", "Check bot response time"),
-    ]
-    await application.bot.set_my_commands(commands)
-    
-    # Load modules
-    module_loader.load_modules(application)
-    
-    info_logger.info("Bot initialization completed")
-
-def main():
-    """Main function to run the bot"""
-    if not BOT_TOKEN:
-        error_logger.error("BOT_TOKEN not found in .env file")
-        sys.exit(1)
-    
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("ping", ping_command))
-    application.add_handler(CommandHandler("modules", modules_command))
-    application.add_handler(CommandHandler("reload", reload_command))
-    application.add_handler(CommandHandler("setrank", setrank_command))
-    application.add_handler(CommandHandler("removerank", removerank_command))
-    application.add_handler(CommandHandler("listranks", listranks_command))
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
-    
-    # Start the bot
-    info_logger.info("Starting bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
+# Usage example:
+# admin_tools = AdminTools()
+# handlers = admin_tools.get_handlers()
+# for handler in handlers:
+#     application.add_handler(handler)
