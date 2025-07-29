@@ -6,6 +6,7 @@ Handles environment loading and bot initialization
 
 import os
 import sys
+import hypergriot_bot
 from dotenv import load_dotenv
 
 def main():
@@ -39,8 +40,7 @@ def main():
         print("\nStarting HyperGriot Bot...")
         import hypergriot_bot
     except ImportError as e:
-        print(f"ERROR: Failed to import bot module: {e}")
-        sys.exit(1)
+        print(f"  Modules Directory: {'modules/' if os.path.exists('modules') else 'modules/ (not found)'}")
     except KeyboardInterrupt:
         print("\nBot stopped by user")
         sys.exit(0)
