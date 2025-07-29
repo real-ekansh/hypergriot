@@ -1,534 +1,630 @@
+import os
+import sys
+import json
+import time
 import asyncio
-import re
+import logging
+import importlib
+import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional, Union
-from telegram import Update, ChatMember, User
-from telegram.ext import ContextTypes, CommandHandler, Application
-from telegram.error import BadRequest, Forbidden
+from typing import Optional, Dict, Any
 
-class AdminTools:
+import telebot
+from telebot import types
+from telebot.async_telebot import AsyncTeleBot
+import pymongo
+from pymongo import MongoClient
+
+# Configuration
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+OWNER_ID = int(os.getenv('OWNER_ID', '0'))
+MONGODB_URL = os.getenv('MONGODB_URL')
+USE_MONGODB = os.getenv('USE_MONGODB', 'false').lower() == 'true'
+
+# Bot initialization
+bot = AsyncTeleBot(BOT_TOKEN)
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# User ranks
+RANKS = {
+    'owner': 5,
+    'dev': 4,
+    'admin': 3,
+    'sudo': 2,
+    'user': 1
+}
+
+class Database:
     def __init__(self):
-        self.muted_users = {}  # Store temporary mutes: {chat_id: {user_id: unmute_time}}
-        self.banned_users = {}  # Store temporary bans: {chat_id: {user_id: unban_time}}
+        self.use_mongodb = USE_MONGODB and MONGODB_URL
+        if self.use_mongodb:
+            self.client = MongoClient(MONGODB_URL)
+            self.db = self.client.hypergriot
+            self.users = self.db.users
+            self.groups = self.db.groups
+        else:
+            self.init_sqlite()
     
-    def parse_time(self, time_str: str) -> Optional[int]:
-        """Parse time string like '1h', '30m', '1d' into seconds"""
-        if not time_str:
+    def init_sqlite(self):
+        self.conn = sqlite3.connect('hypergriot.db', check_same_thread=False)
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                rank TEXT DEFAULT 'user',
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS groups (
+                group_id INTEGER PRIMARY KEY,
+                title TEXT,
+                settings TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.commit()
+    
+    def get_user_rank(self, user_id: int) -> str:
+        if user_id == OWNER_ID:
+            return 'owner'
+        
+        if self.use_mongodb:
+            user = self.users.find_one({'user_id': user_id})
+            return user.get('rank', 'user') if user else 'user'
+        else:
+            cursor = self.conn.execute('SELECT rank FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            return result[0] if result else 'user'
+    
+    def set_user_rank(self, user_id: int, rank: str, username: str = None, first_name: str = None):
+        if self.use_mongodb:
+            self.users.update_one(
+                {'user_id': user_id},
+                {'$set': {'rank': rank, 'username': username, 'first_name': first_name}},
+                upsert=True
+            )
+        else:
+            self.conn.execute('''
+                INSERT OR REPLACE INTO users (user_id, username, first_name, rank)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, username, first_name, rank))
+            self.conn.commit()
+    
+    def get_user_info(self, user_id: int) -> Optional[Dict]:
+        if self.use_mongodb:
+            return self.users.find_one({'user_id': user_id})
+        else:
+            cursor = self.conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            if result:
+                return {
+                    'user_id': result[0],
+                    'username': result[1],
+                    'first_name': result[2],
+                    'rank': result[3],
+                    'joined_at': result[4]
+                }
             return None
-        
-        time_units = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
-        match = re.match(r'^(\d+)([smhdw])$', time_str.lower())
-        
-        if match:
-            amount, unit = match.groups()
-            return int(amount) * time_units[unit]
+
+db = Database()
+
+def parse_time_duration(duration: str) -> int:
+    """Parse time duration like 1d, 2h, 30m, 1w to seconds"""
+    if not duration:
+        return 0
+    
+    multipliers = {
+        'm': 60,
+        'h': 3600,
+        'd': 86400,
+        'w': 604800
+    }
+    
+    try:
+        if duration[-1] in multipliers:
+            number = int(duration[:-1])
+            return number * multipliers[duration[-1]]
+    except (ValueError, IndexError):
+        pass
+    
+    return 0
+
+def check_rank(required_rank: str):
+    """Decorator to check user rank"""
+    def decorator(func):
+        async def wrapper(message):
+            user_rank = db.get_user_rank(message.from_user.id)
+            if RANKS.get(user_rank, 0) >= RANKS.get(required_rank, 0):
+                return await func(message)
+            else:
+                await bot.reply_to(message, "You don't have permission to use this command.")
+        return wrapper
+    return decorator
+
+async def get_user_from_message(message, text: str):
+    """Extract user from message (reply, username, or user_id)"""
+    if message.reply_to_message:
+        return message.reply_to_message.from_user
+    
+    parts = text.split()
+    if len(parts) < 2:
         return None
     
-    async def get_user_from_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: list) -> Optional[User]:
-        """Extract user from command arguments (mention, username, or ID)"""
-        if update.message.reply_to_message:
-            return update.message.reply_to_message.from_user
-        
-        if not args:
+    identifier = parts[1]
+    
+    # If it's a user ID
+    if identifier.isdigit():
+        try:
+            user_id = int(identifier)
+            chat_member = await bot.get_chat_member(message.chat.id, user_id)
+            return chat_member.user
+        except:
             return None
-        
-        user_identifier = args[0]
-        
-        # Check if it's a mention
-        if user_identifier.startswith('@'):
-            username = user_identifier[1:]
+    
+    # If it's a username
+    if identifier.startswith('@'):
+        try:
+            username = identifier[1:]
+            # Try to get user info from database first
+            # In a real scenario, you'd need to maintain a username-to-id mapping
+            return None  # Would need additional implementation
+        except:
+            return None
+    
+    return None
+
+# Module loading system
+def load_modules():
+    """Load modules from modules directory"""
+    modules_dir = 'modules'
+    if not os.path.exists(modules_dir):
+        os.makedirs(modules_dir)
+        return
+    
+    for filename in os.listdir(modules_dir):
+        if filename.endswith('.py') and not filename.startswith('__'):
+            module_name = filename[:-3]
             try:
-                chat_member = await context.bot.get_chat_member(update.effective_chat.id, username)
-                return chat_member.user
-            except:
-                return None
+                spec = importlib.util.spec_from_file_location(
+                    module_name, 
+                    os.path.join(modules_dir, filename)
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                # Register module handlers if they exist
+                if hasattr(module, 'register_handlers'):
+                    module.register_handlers(bot)
+                
+                logger.info(f"Loaded module: {module_name}")
+            except Exception as e:
+                logger.error(f"Failed to load module {module_name}: {e}")
+
+# Basic commands
+@bot.message_handler(commands=['start'])
+async def start_command(message):
+    welcome_text = f"""
+Welcome to HyperGriot Bot!
+
+I'm a powerful group management bot with advanced features.
+
+Use /help to see available commands.
+Bot developed for efficient group management.
+    """
+    await bot.reply_to(message, welcome_text.strip())
+
+@bot.message_handler(commands=['help'])
+async def help_command(message):
+    text = message.text.split()
+    
+    if len(text) > 1:
+        # Help for specific command
+        cmd = text[1].lower()
+        help_texts = {
+            'start': '/start - Start the bot and see welcome message',
+            'help': '/help [command] - Show help or help for specific command',
+            'ping': '/ping - Check if bot is responsive',
+            'status': '/status - Show bot status (sudo+)',
+            'stats': '/stats - Show bot statistics (sudo+)',
+            'shell': '/shell <command> - Execute shell command (owner only)',
+            'setrank': '/setrank <user> <rank> - Set user rank (owner only)',
+            'ban': '/ban [user] [duration] - Ban user from group',
+            'unban': '/unban [user] - Unban user from group',
+            'mute': '/mute [user] [duration] - Mute user in group',
+            'unmute': '/unmute [user] - Unmute user in group',
+            'kick': '/kick [user] - Kick user from group',
+            'promote': '/promote [user] - Promote user to admin',
+            'demote': '/demote [user] - Demote user from admin',
+            'pin': '/pin [reply] - Pin message',
+            'unpin': '/unpin - Unpin message',
+            'purge': '/purge [number] - Delete messages',
+            'id': '/id - Get user ID',
+            'info': '/info [user] - Get user information'
+        }
         
-        # Check if it's a user ID
+        if cmd in help_texts:
+            await bot.reply_to(message, help_texts[cmd])
+        else:
+            await bot.reply_to(message, f"No help available for command: {cmd}")
+    else:
+        # General help
+        user_rank = db.get_user_rank(message.from_user.id)
+        rank_level = RANKS.get(user_rank, 0)
+        
+        help_text = """
+Available Commands:
+
+Basic Commands:
+/start - Start the bot
+/help [command] - Show help
+/ping - Check bot status
+/id - Get your user ID
+/info [user] - Get user information
+        """
+        
+        if rank_level >= RANKS['sudo']:
+            help_text += """
+Sudo Commands:
+/status - Bot status
+/stats - Bot statistics
+            """
+        
+        if rank_level >= RANKS['admin']:
+            help_text += """
+Admin Commands:
+/ban [user] [time] - Ban user
+/unban [user] - Unban user
+/mute [user] [time] - Mute user
+/unmute [user] - Unmute user
+/kick [user] - Kick user
+/promote [user] - Promote user
+/demote [user] - Demote user
+/pin - Pin message (reply)
+/unpin - Unpin message
+/purge [number] - Delete messages
+            """
+        
+        if rank_level >= RANKS['dev']:
+            help_text += """
+Dev Commands:
+All admin commands available
+            """
+        
+        if rank_level >= RANKS['owner']:
+            help_text += """
+Owner Commands:
+/shell <command> - Execute shell
+/setrank <user> <rank> - Set user rank
+            """
+        
+        await bot.reply_to(message, help_text.strip())
+
+@bot.message_handler(commands=['ping'])
+async def ping_command(message):
+    start_time = time.time()
+    sent_message = await bot.reply_to(message, "Pinging...")
+    end_time = time.time()
+    
+    ping_time = round((end_time - start_time) * 1000)
+    await bot.edit_message_text(
+        f"Pong! {ping_time}ms",
+        message.chat.id,
+        sent_message.message_id
+    )
+
+@bot.message_handler(commands=['status'])
+@check_rank('sudo')
+async def status_command(message):
+    uptime = time.time() - start_time
+    hours = int(uptime // 3600)
+    minutes = int((uptime % 3600) // 60)
+    seconds = int(uptime % 60)
+    
+    status_text = f"""
+Bot Status:
+
+Uptime: {hours}h {minutes}m {seconds}s
+Database: {'MongoDB' if db.use_mongodb else 'SQLite'}
+Version: 1.0.0
+Status: Online
+    """
+    await bot.reply_to(message, status_text.strip())
+
+@bot.message_handler(commands=['stats'])
+@check_rank('sudo')
+async def stats_command(message):
+    # Basic stats - can be expanded
+    stats_text = """
+Bot Statistics:
+
+Groups: Active
+Users: Tracked in database
+Commands: All systems operational
+Database: Connected
+    """
+    await bot.reply_to(message, stats_text.strip())
+
+@bot.message_handler(commands=['shell', 'sh'])
+@check_rank('owner')
+async def shell_command(message):
+    if len(message.text.split()) < 2:
+        await bot.reply_to(message, "Usage: /shell <command>")
+        return
+    
+    command = ' '.join(message.text.split()[1:])
+    
+    try:
+        import subprocess
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        output = result.stdout or result.stderr or "Command executed successfully"
+        if len(output) > 4000:
+            output = output[:4000] + "... (truncated)"
+        
+        await bot.reply_to(message, f"```\n{output}\n```", parse_mode='Markdown')
+    except Exception as e:
+        await bot.reply_to(message, f"Error executing command: {str(e)}")
+
+@bot.message_handler(commands=['setrank'])
+@check_rank('owner')
+async def setrank_command(message):
+    parts = message.text.split()
+    if len(parts) < 3:
+        await bot.reply_to(message, "Usage: /setrank <user_id/username> <rank>")
+        return
+    
+    user_identifier = parts[1]
+    new_rank = parts[2].lower()
+    
+    if new_rank not in RANKS:
+        available_ranks = ', '.join(RANKS.keys())
+        await bot.reply_to(message, f"Invalid rank. Available ranks: {available_ranks}")
+        return
+    
+    try:
         if user_identifier.isdigit():
+            user_id = int(user_identifier)
+        else:
+            await bot.reply_to(message, "Please provide user ID for now")
+            return
+        
+        db.set_user_rank(user_id, new_rank)
+        await bot.reply_to(message, f"User {user_id} rank set to {new_rank}")
+    except Exception as e:
+        await bot.reply_to(message, f"Error setting rank: {str(e)}")
+
+@bot.message_handler(commands=['id'])
+async def id_command(message):
+    if message.reply_to_message:
+        user = message.reply_to_message.from_user
+        await bot.reply_to(message, f"User ID: {user.id}")
+    else:
+        await bot.reply_to(message, f"Your ID: {message.from_user.id}")
+
+@bot.message_handler(commands=['info'])
+async def info_command(message):
+    target_user = None
+    
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+    else:
+        parts = message.text.split()
+        if len(parts) > 1 and parts[1].isdigit():
             try:
-                chat_member = await context.bot.get_chat_member(update.effective_chat.id, int(user_identifier))
-                return chat_member.user
+                user_id = int(parts[1])
+                chat_member = await bot.get_chat_member(message.chat.id, user_id)
+                target_user = chat_member.user
             except:
-                return None
-        
-        return None
-    
-    async def is_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-        """Check if user is admin"""
-        try:
-            chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-            return chat_member.status in ['creator', 'administrator']
-        except:
-            return False
-    
-    async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Ban a user permanently"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a user to ban (reply, mention, username, or ID).")
-            return
-        
-        try:
-            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
-            await update.message.reply_text(f"Banned {user.full_name} (ID: {user.id})\nReason: {reason}")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to ban user: {str(e)}")
-    
-    async def sban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Silent ban - ban without notification"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            return
-        
-        try:
-            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except:
-            pass
-    
-    async def tban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Temporarily ban a user"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        if len(context.args) < 2:
-            await update.message.reply_text("Usage: /tban <user> <time> [reason]\nExample: /tban @username 1h spam")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a valid user.")
-            return
-        
-        duration = self.parse_time(context.args[1])
-        if not duration:
-            await update.message.reply_text("Invalid time format. Use: 1s, 1m, 1h, 1d, 1w")
-            return
-        
-        try:
-            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-            
-            # Schedule unban
-            chat_id = update.effective_chat.id
-            if chat_id not in self.banned_users:
-                self.banned_users[chat_id] = {}
-            
-            unban_time = datetime.now() + timedelta(seconds=duration)
-            self.banned_users[chat_id][user.id] = unban_time
-            
-            reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
-            await update.message.reply_text(f"Temporarily banned {user.full_name} for {context.args[1]}\nReason: {reason}")
-            
-            # Schedule unban task
-            asyncio.create_task(self.schedule_unban(context, chat_id, user.id, duration))
-        except Exception as e:
-            await update.message.reply_text(f"Failed to ban user: {str(e)}")
-    
-    async def kick_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Kick a user (ban and immediately unban)"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a user to kick.")
-            return
-        
-        try:
-            await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-            await context.bot.unban_chat_member(update.effective_chat.id, user.id)
-            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
-            await update.message.reply_text(f"Kicked {user.full_name} (ID: {user.id})\nReason: {reason}")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to kick user: {str(e)}")
-    
-    async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Unban a user"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a user to unban.")
-            return
-        
-        try:
-            await context.bot.unban_chat_member(update.effective_chat.id, user.id)
-            await update.message.reply_text(f"Unbanned {user.full_name} (ID: {user.id})")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to unban user: {str(e)}")
-    
-    async def mute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mute a user permanently"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a user to mute.")
-            return
-        
-        try:
-            await context.bot.restrict_chat_member(
-                update.effective_chat.id, 
-                user.id,
-                permissions=ChatMember.RESTRICTED
-            )
-            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
-            await update.message.reply_text(f"Muted {user.full_name} (ID: {user.id})\nReason: {reason}")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to mute user: {str(e)}")
-    
-    async def smute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Silent mute - mute without notification"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            return
-        
-        try:
-            await context.bot.restrict_chat_member(
-                update.effective_chat.id, 
-                user.id,
-                permissions=ChatMember.RESTRICTED
-            )
-            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except:
-            pass
-    
-    async def tmute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Temporarily mute a user"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        if len(context.args) < 2:
-            await update.message.reply_text("Usage: /tmute <user> <time> [reason]\nExample: /tmute @username 1h spam")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a valid user.")
-            return
-        
-        duration = self.parse_time(context.args[1])
-        if not duration:
-            await update.message.reply_text("Invalid time format. Use: 1s, 1m, 1h, 1d, 1w")
-            return
-        
-        try:
-            await context.bot.restrict_chat_member(
-                update.effective_chat.id, 
-                user.id,
-                permissions=ChatMember.RESTRICTED,
-                until_date=datetime.now() + timedelta(seconds=duration)
-            )
-            
-            reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
-            await update.message.reply_text(f"Temporarily muted {user.full_name} for {context.args[1]}\nReason: {reason}")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to mute user: {str(e)}")
-    
-    async def unmute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Unmute a user"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a user to unmute.")
-            return
-        
-        try:
-            await context.bot.restrict_chat_member(
-                update.effective_chat.id, 
-                user.id,
-                permissions=ChatMember.MEMBER
-            )
-            await update.message.reply_text(f"Unmuted {user.full_name} (ID: {user.id})")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to unmute user: {str(e)}")
-    
-    async def promote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Promote a user to admin"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a user to promote.")
-            return
-        
-        try:
-            await context.bot.promote_chat_member(
-                update.effective_chat.id, 
-                user.id,
-                can_delete_messages=True,
-                can_restrict_members=True,
-                can_pin_messages=True,
-                can_invite_users=True
-            )
-            title = " ".join(context.args[1:]) if len(context.args) > 1 else None
-            if title:
-                await context.bot.set_chat_administrator_custom_title(update.effective_chat.id, user.id, title)
-            
-            await update.message.reply_text(f"Promoted {user.full_name} (ID: {user.id})" + (f" with title: {title}" if title else ""))
-        except Exception as e:
-            await update.message.reply_text(f"Failed to promote user: {str(e)}")
-    
-    async def demote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Demote an admin to regular user"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        user = await self.get_user_from_message(update, context, context.args)
-        if not user:
-            await update.message.reply_text("Please specify a user to demote.")
-            return
-        
-        try:
-            await context.bot.promote_chat_member(
-                update.effective_chat.id, 
-                user.id,
-                can_delete_messages=False,
-                can_restrict_members=False,
-                can_pin_messages=False,
-                can_invite_users=False,
-                can_promote_members=False
-            )
-            await update.message.reply_text(f"Demoted {user.full_name} (ID: {user.id})")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to demote user: {str(e)}")
-    
-    async def pin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Pin a message"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        if not update.message.reply_to_message:
-            await update.message.reply_text("Reply to a message to pin it.")
-            return
-        
-        try:
-            await context.bot.pin_chat_message(
-                update.effective_chat.id, 
-                update.message.reply_to_message.message_id,
-                disable_notification=False
-            )
-            await update.message.reply_text("Message pinned successfully.")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to pin message: {str(e)}")
-    
-    async def unpin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Unpin a message"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        try:
-            if update.message.reply_to_message:
-                await context.bot.unpin_chat_message(
-                    update.effective_chat.id, 
-                    update.message.reply_to_message.message_id
-                )
-            else:
-                await context.bot.unpin_all_chat_messages(update.effective_chat.id)
-            
-            await update.message.reply_text("Message(s) unpinned successfully.")
-        except Exception as e:
-            await update.message.reply_text(f"Failed to unpin message: {str(e)}")
-    
-    async def purge_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Delete messages (reply to start message or specify count)"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            await update.message.reply_text("You need admin permissions to use this command.")
-            return
-        
-        if update.message.reply_to_message:
-            # Delete from replied message to current
-            start_id = update.message.reply_to_message.message_id
-            end_id = update.message.message_id
-            deleted = 0
-            
-            for msg_id in range(start_id, end_id + 1):
-                try:
-                    await context.bot.delete_message(update.effective_chat.id, msg_id)
-                    deleted += 1
-                except:
-                    continue
-            
-            await update.message.reply_text(f"Deleted {deleted} messages.")
-        elif context.args and context.args[0].isdigit():
-            # Delete specified number of messages
-            count = min(int(context.args[0]), 100)  # Limit to 100
-            deleted = 0
-            current_id = update.message.message_id
-            
-            for i in range(count + 1):  # +1 to include command message
-                try:
-                    await context.bot.delete_message(update.effective_chat.id, current_id - i)
-                    deleted += 1
-                except:
-                    continue
-            
-            # Send confirmation and delete it after 3 seconds
-            confirm_msg = await context.bot.send_message(
-                update.effective_chat.id, 
-                f"Deleted {deleted} messages."
-            )
-            asyncio.create_task(self.delete_after_delay(context, update.effective_chat.id, confirm_msg.message_id, 3))
+                await bot.reply_to(message, "User not found")
+                return
         else:
-            await update.message.reply_text("Reply to a message to start purging from there, or specify number of messages to delete.")
+            target_user = message.from_user
     
-    async def spurge_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Silent purge - delete messages without confirmation"""
-        if not await self.is_admin(update, context, update.effective_user.id):
-            return
+    if target_user:
+        user_info = db.get_user_info(target_user.id)
+        rank = db.get_user_rank(target_user.id)
         
-        if update.message.reply_to_message:
-            start_id = update.message.reply_to_message.message_id
-            end_id = update.message.message_id
-            
-            for msg_id in range(start_id, end_id + 1):
-                try:
-                    await context.bot.delete_message(update.effective_chat.id, msg_id)
-                except:
-                    continue
-        elif context.args and context.args[0].isdigit():
-            count = min(int(context.args[0]), 100)
-            current_id = update.message.message_id
-            
-            for i in range(count + 1):
-                try:
-                    await context.bot.delete_message(update.effective_chat.id, current_id - i)
-                except:
-                    continue
-    
-    async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get user/chat ID information"""
-        if update.message.reply_to_message:
-            user = update.message.reply_to_message.from_user
-            await update.message.reply_text(
-                f"User ID: {user.id}\n"
-                f"Name: {user.full_name}\n"
-                f"Username: @{user.username if user.username else 'None'}\n"
-                f"Chat ID: {update.effective_chat.id}"
-            )
-        elif context.args:
-            user = await self.get_user_from_message(update, context, context.args)
-            if user:
-                await update.message.reply_text(
-                    f"User ID: {user.id}\n"
-                    f"Name: {user.full_name}\n"
-                    f"Username: @{user.username if user.username else 'None'}\n"
-                    f"Chat ID: {update.effective_chat.id}"
-                )
-            else:
-                await update.message.reply_text("User not found.")
-        else:
-            await update.message.reply_text(
-                f"Your ID: {update.effective_user.id}\n"
-                f"Chat ID: {update.effective_chat.id}"
-            )
-    
-    async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get detailed user information"""
-        user = None
-        
-        if update.message.reply_to_message:
-            user = update.message.reply_to_message.from_user
-        elif context.args:
-            user = await self.get_user_from_message(update, context, context.args)
-        else:
-            user = update.effective_user
-        
-        if not user:
-            await update.message.reply_text("User not found.")
-            return
-        
-        try:
-            chat_member = await context.bot.get_chat_member(update.effective_chat.id, user.id)
-            
-            info_text = f"User Information:\n"
-            info_text += f"ID: {user.id}\n"
-            info_text += f"Name: {user.full_name}\n"
-            info_text += f"Username: @{user.username if user.username else 'None'}\n"
-            info_text += f"Status: {chat_member.status}\n"
-            info_text += f"Is Bot: {'Yes' if user.is_bot else 'No'}\n"
-            
-            if chat_member.status == 'restricted':
-                info_text += f"Restricted: Yes\n"
-            
-            await update.message.reply_text(info_text)
-        except Exception as e:
-            await update.message.reply_text(f"Failed to get user info: {str(e)}")
-    
-    async def schedule_unban(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, duration: int):
-        """Schedule automatic unban after duration"""
-        await asyncio.sleep(duration)
-        try:
-            await context.bot.unban_chat_member(chat_id, user_id)
-            if chat_id in self.banned_users and user_id in self.banned_users[chat_id]:
-                del self.banned_users[chat_id][user_id]
-        except:
-            pass
-    
-    async def delete_after_delay(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int):
-        """Delete a message after specified delay"""
-        await asyncio.sleep(delay)
-        try:
-            await context.bot.delete_message(chat_id, message_id)
-        except:
-            pass
-    
-    def get_handlers(self):
-        """Get all command handlers"""
-        return [
-            CommandHandler("ban", self.ban_command),
-            CommandHandler("sban", self.sban_command),
-            CommandHandler("tban", self.tban_command),
-            CommandHandler("kick", self.kick_command),
-            CommandHandler("unban", self.unban_command),
-            CommandHandler("mute", self.mute_command),
-            CommandHandler("smute", self.smute_command),
-            CommandHandler("tmute", self.tmute_command),
-            CommandHandler("unmute", self.unmute_command),
-            CommandHandler("promote", self.promote_command),
-            CommandHandler("demote", self.demote_command),
-            CommandHandler("pin", self.pin_command),
-            CommandHandler("unpin", self.unpin_command),
-            CommandHandler("purge", self.purge_command),
-            CommandHandler("spurge", self.spurge_command),
-            CommandHandler("id", self.id_command),
-            CommandHandler("info", self.info_command),
-        ]
+        info_text = f"""
+User Information:
 
-# Setup function for module loading
-def setup():
-    """Setup function to initialize the admin tools module"""
-    admin_tools = AdminTools()
-    return admin_tools.get_handlers()
+ID: {target_user.id}
+Username: @{target_user.username or 'None'}
+First Name: {target_user.first_name or 'None'}
+Last Name: {target_user.last_name or 'None'}
+Rank: {rank}
+        """
+        
+        if user_info and 'joined_at' in user_info:
+            info_text += f"Joined: {user_info['joined_at']}"
+        
+        await bot.reply_to(message, info_text.strip())
 
-# Usage example:
-# admin_tools = AdminTools()
-# handlers = admin_tools.get_handlers()
-# for handler in handlers:
-#     application.add_handler(handler)
+# Admin commands
+@bot.message_handler(commands=['ban', 'tban'])
+@check_rank('admin')
+async def ban_command(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        await bot.reply_to(message, "This command can only be used in groups")
+        return
+    
+    target_user = await get_user_from_message(message, message.text)
+    if not target_user:
+        await bot.reply_to(message, "Please reply to a user or provide user ID")
+        return
+    
+    # Check if duration is specified
+    parts = message.text.split()
+    duration_seconds = 0
+    ban_until = None
+    
+    if len(parts) > 2 or (len(parts) > 1 and not message.reply_to_message):
+        duration_str = parts[-1]
+        duration_seconds = parse_time_duration(duration_str)
+        if duration_seconds > 0:
+            ban_until = int(time.time()) + duration_seconds
+    
+    try:
+        await bot.ban_chat_member(
+            message.chat.id, 
+            target_user.id,
+            until_date=ban_until
+        )
+        
+        duration_text = f" for {parts[-1]}" if duration_seconds > 0 else " permanently"
+        await bot.reply_to(message, f"User {target_user.first_name} banned{duration_text}")
+    except Exception as e:
+        await bot.reply_to(message, f"Failed to ban user: {str(e)}")
+
+@bot.message_handler(commands=['unban'])
+@check_rank('admin')
+async def unban_command(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        await bot.reply_to(message, "This command can only be used in groups")
+        return
+    
+    target_user = await get_user_from_message(message, message.text)
+    if not target_user:
+        await bot.reply_to(message, "Please reply to a user or provide user ID")
+        return
+    
+    try:
+        await bot.unban_chat_member(message.chat.id, target_user.id)
+        await bot.reply_to(message, f"User {target_user.first_name} unbanned")
+    except Exception as e:
+        await bot.reply_to(message, f"Failed to unban user: {str(e)}")
+
+@bot.message_handler(commands=['kick', 'skick'])
+@check_rank('admin')
+async def kick_command(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        await bot.reply_to(message, "This command can only be used in groups")
+        return
+    
+    target_user = await get_user_from_message(message, message.text)
+    if not target_user:
+        await bot.reply_to(message, "Please reply to a user or provide user ID")
+        return
+    
+    try:
+        await bot.ban_chat_member(message.chat.id, target_user.id)
+        await bot.unban_chat_member(message.chat.id, target_user.id)
+        
+        if not message.text.startswith('/s'):
+            await bot.reply_to(message, f"User {target_user.first_name} kicked")
+    except Exception as e:
+        await bot.reply_to(message, f"Failed to kick user: {str(e)}")
+
+# Add more admin commands...
+@bot.message_handler(commands=['mute', 'tmute', 'smute'])
+@check_rank('admin')
+async def mute_command(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        await bot.reply_to(message, "This command can only be used in groups")
+        return
+    
+    target_user = await get_user_from_message(message, message.text)
+    if not target_user:
+        await bot.reply_to(message, "Please reply to a user or provide user ID")
+        return
+    
+    # Parse duration
+    parts = message.text.split()
+    duration_seconds = 0
+    mute_until = None
+    
+    if len(parts) > 2 or (len(parts) > 1 and not message.reply_to_message):
+        duration_str = parts[-1]
+        duration_seconds = parse_time_duration(duration_str)
+        if duration_seconds > 0:
+            mute_until = int(time.time()) + duration_seconds
+    
+    try:
+        permissions = types.ChatPermissions(
+            can_send_messages=False,
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
+            can_add_web_page_previews=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False
+        )
+        
+        await bot.restrict_chat_member(
+            message.chat.id,
+            target_user.id,
+            permissions=permissions,
+            until_date=mute_until
+        )
+        
+        if not message.text.startswith('/s'):
+            duration_text = f" for {parts[-1]}" if duration_seconds > 0 else " permanently"
+            await bot.reply_to(message, f"User {target_user.first_name} muted{duration_text}")
+    except Exception as e:
+        await bot.reply_to(message, f"Failed to mute user: {str(e)}")
+
+@bot.message_handler(commands=['unmute'])
+@check_rank('admin')
+async def unmute_command(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        await bot.reply_to(message, "This command can only be used in groups")
+        return
+    
+    target_user = await get_user_from_message(message, message.text)
+    if not target_user:
+        await bot.reply_to(message, "Please reply to a user or provide user ID")
+        return
+    
+    try:
+        permissions = types.ChatPermissions(
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=False,
+            can_invite_users=True,
+            can_pin_messages=False
+        )
+        
+        await bot.restrict_chat_member(
+            message.chat.id,
+            target_user.id,
+            permissions=permissions
+        )
+        
+        await bot.reply_to(message, f"User {target_user.first_name} unmuted")
+    except Exception as e:
+        await bot.reply_to(message, f"Failed to unmute user: {str(e)}")
+
+# Global variables
+start_time = time.time()
+
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        print("BOT_TOKEN environment variable is required!")
+        sys.exit(1)
+    
+    if not OWNER_ID:
+        print("OWNER_ID environment variable is required!")
+        sys.exit(1)
+    
+    # Load modules
+    load_modules()
+    
+    print("HyperGriot Bot starting...")
+    print(f"Database: {'MongoDB' if db.use_mongodb else 'SQLite'}")
+    
+    # Start bot
+    asyncio.run(bot.polling(non_stop=True))
