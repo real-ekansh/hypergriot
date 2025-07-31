@@ -1,10 +1,9 @@
-# Configuration Script 
 import os
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 logger = logging.getLogger(__name__)
 
 try:
